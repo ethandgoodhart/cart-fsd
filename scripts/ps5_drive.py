@@ -57,6 +57,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -436,6 +437,99 @@ def _set_motor_current_soft_max(axis, value: float) -> None:
     m = axis.motor
     if hasattr(m, "config") and hasattr(m.config, "current_soft_max"):
         m.config.current_soft_max = value
+
+
+class KeepAlive(threading.Thread):
+    """Dedicated 50 Hz heartbeat thread for the Mega and the ODrive watchdog.
+
+    macOS AppNap throttles the pygame main loop to ~1 Hz whenever the
+    pygame window loses focus, which is slower than either the Mega's
+    300 ms serial heartbeat timeout or the ODrive's 300 ms axis watchdog
+    timeout. Both would then trip — the pedals would retract, the ODrive
+    would IDLE — just because the operator alt-tabbed to Settings.
+
+    This thread ticks at a fixed rate independent of the render loop.
+    Each tick it:
+      - writes a single ``H\\n`` byte to the Mega (the firmware treats
+        any byte as a heartbeat, so the watchdog stays fed without
+        changing the last-commanded G/B targets), and
+      - calls ``axis.watchdog_feed()`` on the ODrive so the axis stays
+        armed at the last commanded ``input_pos``.
+
+    Commands still flow through the main loop (``pedals.send``,
+    ``steering.command_deg``). While backgrounded, those update at the
+    throttled rate, which is fine: the firmware holds the last target
+    until the host resumes. This thread just makes sure the firmware
+    doesn't give up on us in the meantime.
+
+    Thread safety: the lock owned here is also acquired by main-thread
+    hardware calls (see ``hw_lock`` in main()). Never touch the
+    hardware without it.
+    """
+
+    def __init__(
+        self,
+        pedals: "PedalLink | None",
+        steering: "SteeringLink | None",
+        lock: threading.Lock,
+        hz: float = 50.0,
+    ):
+        super().__init__(daemon=True, name="cart-keepalive")
+        self.pedals = pedals
+        self.steering = steering
+        self.lock = lock
+        self.period = 1.0 / hz
+        self.stop_event = threading.Event()
+
+    def stop(self) -> None:
+        self.stop_event.set()
+
+    def run(self) -> None:
+        # time.monotonic-scheduled loop: drift-free even if a tick runs long.
+        next_t = time.monotonic() + self.period
+        while not self.stop_event.is_set():
+            now = time.monotonic()
+            if now < next_t:
+                # Wake on stop_event OR when the tick is due — whichever first.
+                self.stop_event.wait(timeout=next_t - now)
+                if self.stop_event.is_set():
+                    break
+            next_t += self.period
+            # Resync if we fell far behind (e.g. process was suspended).
+            overshoot = time.monotonic() - next_t
+            if overshoot > 5 * self.period:
+                next_t = time.monotonic() + self.period
+
+            with self.lock:
+                self._tick()
+
+    def _tick(self) -> None:
+        # Mega heartbeat — a bare ``H`` ping, no target change. Protected
+        # against a faulted/closed port: if writes are failing the main
+        # loop already saw the fault and is exiting.
+        p = self.pedals
+        if p is not None and p.ser is not None and not p.faulted and not p.dry_run:
+            try:
+                p.ser.write(b"H\n")
+                p.last_ok_s = time.monotonic()
+            except Exception:
+                # Let PedalLink.send / main loop surface the fault on its
+                # next iteration — don't stomp state from here.
+                pass
+
+        # ODrive axis watchdog feed. Only once the watchdog has been
+        # armed (which happens right before the main loop starts).
+        s = self.steering
+        if (
+            s is not None
+            and not s.dry_run
+            and s._watchdog_enabled
+            and s.axis is not None
+        ):
+            try:
+                s.axis.watchdog_feed()
+            except Exception:
+                pass
 
 
 class SteeringLink:
@@ -895,6 +989,14 @@ def main() -> int:
         if steering is not None:
             steering.arm_watchdog()
 
+        # Hardware lock shared with the KeepAlive thread. Every main-loop
+        # HW call (``pedals.send/poll``, ``steering.command_deg``, Triangle
+        # rebase) acquires this, so the daemon's 50 Hz heartbeats can't
+        # interleave with target writes and confuse the firmware/ODrive.
+        hw_lock = threading.Lock()
+        keepalive = KeepAlive(pedals, steering, hw_lock)
+        keepalive.start()
+
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -910,7 +1012,8 @@ def main() -> int:
                     # target angle is also reset so the trap planner doesn't
                     # yank the wheel back to the old zero.
                     if control_steering and steering is not None:
-                        new_zero = steering.rebase_zero()
+                        with hw_lock:
+                            new_zero = steering.rebase_zero()
                         steer_target_deg = 0.0
                         print(
                             f"[steering] △ Triangle: zero rebased to "
@@ -921,7 +1024,8 @@ def main() -> int:
             # Done before the liveness check so an e-stop press is handled
             # even on the frame the controller also drops.
             if pedals is not None:
-                pedals.poll()
+                with hw_lock:
+                    pedals.poll()
                 if pedals.estop_active:
                     print("[main] E-STOP engaged on Mega — idling steering.")
                     running = False
@@ -962,7 +1066,8 @@ def main() -> int:
                     and steering is not None
                     and not steering.dry_run
                 ):
-                    steer_deg = steering.column_deg_estimate()
+                    with hw_lock:
+                        steer_deg = steering.column_deg_estimate()
                 else:
                     steer_deg = steer_target_deg
             else:
@@ -976,7 +1081,8 @@ def main() -> int:
             # Drive pedals first so the heartbeat ticks before we commit
             # to moving the steering wheel this frame.
             if control_pedals and pedals is not None:
-                pedals.send(gas, brake)
+                with hw_lock:
+                    pedals.send(gas, brake)
                 if pedals.faulted:
                     # Pedal link is gone — the Mega will retract both
                     # pedals on its own watchdog in ~300 ms, but we must
@@ -992,7 +1098,8 @@ def main() -> int:
                     if args.stick_steering == "integrated"
                     else steer_deg
                 )
-                steering.command_deg(cmd_deg, lx=lx, dlx_dt=dlx_dt, dt_s=dt_s)
+                with hw_lock:
+                    steering.command_deg(cmd_deg, lx=lx, dlx_dt=dlx_dt, dt_s=dt_s)
 
             draw_ui(screen, font, font_small, {
                 "mode": args.mode,
@@ -1016,6 +1123,15 @@ def main() -> int:
         print(f"[main] fatal: {e}")
         exit_code = 1
     finally:
+        # Stop the keep-alive thread FIRST so it can't race the final
+        # stop() calls below. ``keepalive`` only exists once we reached
+        # the arm_watchdog step — earlier failures skip straight to
+        # hardware teardown.
+        try:
+            keepalive.stop()
+            keepalive.join(timeout=1.0)
+        except NameError:
+            pass
         if pedals is not None:
             pedals.stop()
             pedals.close()

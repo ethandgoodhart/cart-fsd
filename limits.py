@@ -81,8 +81,8 @@ STEERING_BELT_RATIO = 3.0
 # Soft angle limits measured AT THE STEERING COLUMN (same frame as the
 # steering wheel). Provisional ±90° until the mechanical lock-to-lock range
 # is measured — see the open TODO in docs/steering.md.
-STEERING_MIN_DEG = -180.0
-STEERING_MAX_DEG = 180.0
+STEERING_MIN_DEG = -270.0
+STEERING_MAX_DEG = 270.0
 
 
 def steering_deg_to_motor_turns(column_deg: float) -> float:
