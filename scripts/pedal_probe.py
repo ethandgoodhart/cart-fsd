@@ -6,12 +6,15 @@ firmware's actual pot readings (g, b) track the targets (tg, tb).
 """
 from __future__ import annotations
 
-import sys, time, threading
+import os, sys, time, threading
 from pathlib import Path
 
 _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
+
+# Keep SDL polling when the pygame window is not focused.
+os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
 
 import pygame
 import serial

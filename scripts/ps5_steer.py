@@ -46,6 +46,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import os
 import sys
 import time
 from pathlib import Path
@@ -53,6 +54,11 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+# Keep SDL delivering joystick input when the pygame window is not focused
+# (macOS freezes axes on focus loss otherwise). Must be set before ``import
+# pygame`` so SDL picks it up at initialization.
+os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
 
 import pygame
 

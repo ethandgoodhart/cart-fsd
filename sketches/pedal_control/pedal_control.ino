@@ -51,6 +51,11 @@ const int BRAKE_L_EN  = 7;
 const int BRAKE_L_PWM = 5;
 const int BRAKE_POT   = A0;
 
+// Software E-stop (see docs/estop.md). NC button, INPUT_PULLUP. With NC
+// contacts: LOW = normal, HIGH = pressed OR wire broken (fail-safe).
+const int ESTOP_PIN = 2;
+const unsigned long ESTOP_DEBOUNCE_MS = 50UL;
+
 // ---- Control tuning -----------------------------------------------------
 // PWM duty per pedal while moving (0..255). Pulled from cart_limits.h so
 // limits.py stays the single source of truth.
@@ -95,6 +100,24 @@ Pedal brake = { "brake", BRAKE_R_EN, BRAKE_R_PWM, BRAKE_L_EN, BRAKE_L_PWM, BRAKE
 unsigned long last_host_byte_ms = 0;
 unsigned long last_status_ms    = 0;
 bool failsafe = true;   // start in failsafe; require a command to arm
+
+// ---- E-stop state -------------------------------------------------------
+// ``estop_active`` is the debounced logical state that drives pedal
+// override (force brake full on, gas fully released). The ISR just sets
+// a flag; the main loop does the heavy lifting so we never spend any
+// serious time in interrupt context.
+volatile bool estop_isr_event = false;
+volatile unsigned long estop_last_isr_ms = 0;
+bool estop_active = false;              // current debounced state
+bool estop_last_pin_state = false;      // last raw read (LOW=normal, HIGH=estop)
+
+void estopISR() {
+  unsigned long now = millis();
+  if (now - estop_last_isr_ms > ESTOP_DEBOUNCE_MS) {
+    estop_isr_event = true;
+    estop_last_isr_ms = now;
+  }
+}
 
 // Line-buffered command parser.
 char line_buf[32];
@@ -226,6 +249,52 @@ void checkHeartbeat() {
   }
 }
 
+// Poll the e-stop pin, debounce, and on a state change:
+//   - emit EVT,ESTOP,1|0 for the host to act on (idle ODrive, stop loop)
+//   - while pressed, force brake to MAX and gas to MIN so the cart brakes
+//     even if the host is missing in action. The override is applied here,
+//     AFTER pumpSerial() handled any inbound G/B, so it always wins.
+void checkEstop() {
+  // Polled read drives edge detection for both press and release; the
+  // ISR only flags a press so we don't miss it when loop() is slow.
+  bool raw = digitalRead(ESTOP_PIN) == HIGH;
+  if (raw != estop_last_pin_state) {
+    // Debounce via the same window the ISR uses.
+    unsigned long now = millis();
+    if (now - estop_last_isr_ms > ESTOP_DEBOUNCE_MS) {
+      estop_last_pin_state = raw;
+      if (raw != estop_active) {
+        estop_active = raw;
+        Serial.print(F("EVT,ESTOP,")); Serial.println(estop_active ? 1 : 0);
+        if (estop_active) {
+          Serial.println(F("INFO,ESTOP engaged — full brake, gas released"));
+        } else {
+          Serial.println(F("INFO,ESTOP released — accepting commands again"));
+        }
+      }
+      estop_last_isr_ms = now;
+    }
+  }
+  // Consume any ISR-flagged press the poll missed (blocked loop iteration).
+  if (estop_isr_event) {
+    noInterrupts(); estop_isr_event = false; interrupts();
+    if (!estop_active) {
+      estop_active = true;
+      estop_last_pin_state = true;
+      Serial.println(F("EVT,ESTOP,1"));
+      Serial.println(F("INFO,ESTOP engaged (via ISR) — full brake, gas released"));
+    }
+  }
+
+  // Whenever the e-stop is active, slam targets regardless of what the
+  // host last asked for. Re-applied every loop so even a rogue G/B
+  // command can't escape the override for a single cycle.
+  if (estop_active) {
+    gas.target   = gas.pot_min;
+    brake.target = brake.pot_max;
+  }
+}
+
 void emitStatus() {
   unsigned long now = millis();
   if (now - last_status_ms < STATUS_INTERVAL_MS) return;
@@ -237,7 +306,8 @@ void emitStatus() {
   Serial.print(F(",tg="));      Serial.print(gas.target, 3);
   Serial.print(F(",tb="));      Serial.print(brake.target, 3);
   Serial.print(F(",hb="));      Serial.print(age);
-  Serial.print(F(",fs="));      Serial.println(failsafe ? 1 : 0);
+  Serial.print(F(",fs="));      Serial.print(failsafe ? 1 : 0);
+  Serial.print(F(",es="));      Serial.println(estop_active ? 1 : 0);
 }
 
 // ---- Setup / loop -------------------------------------------------------
@@ -262,6 +332,15 @@ void setup() {
   driveStop(gas);
   driveStop(brake);
 
+  // E-stop input + interrupt. NC contacts + INPUT_PULLUP: LOW = normal,
+  // HIGH = pressed or wire broken. RISING catches the press; the polled
+  // check in checkEstop() catches both edges for observability.
+  pinMode(ESTOP_PIN, INPUT_PULLUP);
+  bool initial_estop = digitalRead(ESTOP_PIN) == HIGH;
+  estop_active = initial_estop;
+  estop_last_pin_state = initial_estop;
+  attachInterrupt(digitalPinToInterrupt(ESTOP_PIN), estopISR, RISING);
+
   // Prime the heartbeat to "already stale" so we come up in FAILSAFE and
   // only leave it once the host proves it's alive.
   last_host_byte_ms = millis() - HEARTBEAT_TIMEOUT_MS - 1;
@@ -270,12 +349,19 @@ void setup() {
   Serial.println(F("INFO,protocol: G<f>\\n | B<f>\\n | S\\n | H\\n  (any byte = heartbeat)"));
   Serial.print  (F("INFO,heartbeat timeout = ")); Serial.print(HEARTBEAT_TIMEOUT_MS);
   Serial.println(F(" ms"));
+  Serial.print  (F("INFO,e-stop pin = ")); Serial.print(ESTOP_PIN);
+  Serial.print  (F(" (initial state: ")); Serial.print(initial_estop ? F("PRESSED") : F("normal"));
+  Serial.println(F(")"));
+  if (initial_estop) {
+    Serial.println(F("EVT,ESTOP,1"));
+  }
   Serial.println(F("INFO,booting in FAILSAFE — send any command to arm"));
 }
 
 void loop() {
   pumpSerial();
   checkHeartbeat();
+  checkEstop();   // must run AFTER pumpSerial so e-stop overrides commands
 
   stepPedal(gas);
   stepPedal(brake);

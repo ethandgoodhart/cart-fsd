@@ -25,7 +25,12 @@ Usage:
 
 import argparse
 import math
+import os
 import sys
+
+# Keep SDL polling the controller when the pygame window is not focused
+# (macOS freezes axes on focus loss otherwise).
+os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
 
 import pygame
 

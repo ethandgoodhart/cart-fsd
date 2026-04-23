@@ -55,6 +55,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -64,6 +65,14 @@ from pathlib import Path
 _PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
+
+# SDL pauses joystick polling when the pygame window loses focus (macOS in
+# particular will freeze axes at their last value if you alt-tab to another
+# app). Setting this hint before ``import pygame`` keeps the DualSense live
+# regardless of which window is frontmost — necessary for a cart-driving
+# tool where you might legitimately tab away to read logs or adjust a
+# config, and the pedals must not silently stop responding.
+os.environ.setdefault("SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", "1")
 
 import pygame
 
@@ -86,6 +95,10 @@ AXIS_LEFT_X = 0
 AXIS_L2 = 4
 AXIS_R2 = 5
 
+# DualSense face buttons on SDL 2.28+ (macOS / Linux): Cross=0, Circle=1,
+# Square=2, Triangle=3. Matches scripts/ps5_steer.py.
+BUTTON_TRIANGLE = 3
+
 # Default deadzone (e.g. other scripts). Steering X uses ``STEER_STICK_DEADZONE`` so
 # more physical travel maps to rate — a large deadzone + remap makes mid‑stick feel weak.
 STICK_DEADZONE = 0.08
@@ -98,10 +111,11 @@ TRIGGER_MAX_R2 = 1.00
 
 # --- Cart-side mapping ------------------------------------------------------
 
-# Steering authority for PS5 driving. Clamped against the cart-wide soft
-# limits, then further narrowed while we're still early-testing — widen
-# this once the full lock-to-lock range is known and trusted.
-PS5_STEERING_MAX_DEG = min(60.0, STEERING_MAX_DEG, -STEERING_MIN_DEG)
+# Steering authority for PS5 driving. Uses the cart-wide soft limits
+# defined in limits.py (``STEERING_MIN/MAX_DEG``) — to widen/narrow the
+# human-driving range, edit limits.py so the change is consistent with
+# the autonomy stack when it lands.
+PS5_STEERING_MAX_DEG = min(STEERING_MAX_DEG, -STEERING_MIN_DEG)
 
 # Trapezoidal planner caps — **match ``main.py``** so PS5 steering uses the same
 # consistent ODrive-generated motion as calibration sweeps (motor-side units).
@@ -122,6 +136,12 @@ PS5_STEER_CURRENT_HARD_CAP_A = 80.0  # never raise soft_max above this (motor / 
 # Reference scales for mapping stick dynamics into current demand (tunable).
 STICK_DLX_REF = 10.0                  # |dlx/dt| ≈ this → full “stick dynamics” contribution
 VEL_CMD_ACCEL_REF = 120.0             # motor turns/s² reference for ω_cmd slew
+
+# ODrive axis watchdog: the motor-side equivalent of the Mega's heartbeat.
+# The host must call ``axis.watchdog_feed()`` inside this window or the
+# ODrive disarms itself. Only enforced once the axis enters closed-loop
+# control, so setup-time pauses don't trip it. Matches the Mega's 300 ms.
+STEERING_WATCHDOG_S = 0.30
 
 # Main-loop rate for reading the controller and pushing commands.
 CONTROL_HZ = 50.0
@@ -164,6 +184,32 @@ def read_trigger(js, axis: int, scale: float) -> float:
     raw = js.get_axis(axis)
     value = max(0.0, min(1.0, (raw + 1.0) / 2.0))
     return min(1.0, value / scale) if scale > 0 else 0.0
+
+
+def controller_alive(js) -> tuple[bool, str]:
+    """Return ``(True, "")`` while the DualSense is still usable.
+
+    Bluetooth drops (out of range, dead battery, driver glitch) frequently
+    *don't* produce a ``JOYDEVICEREMOVED`` event — SDL keeps the Joystick
+    object around and quietly freezes the axes at their last value. The
+    firmware watchdog will retract the pedals on its own after 300 ms, but
+    by then the host is still telling the cart to gas. We actively probe
+    every frame so the host stops commanding the moment the link dies.
+
+    Checks, in order of strictness:
+      1. ``pygame.joystick.get_count() == 0`` — SDL has fully forgotten it.
+      2. ``js.get_numaxes()`` raises — object invalidated mid-session.
+      3. ``js.get_init()`` is False — someone released the handle.
+    """
+    if pygame.joystick.get_count() == 0:
+        return False, "no joysticks enumerated"
+    try:
+        if not js.get_init():
+            return False, "joystick handle uninitialized"
+        _ = js.get_numaxes()
+    except pygame.error as e:
+        return False, f"joystick invalidated: {e}"
+    return True, ""
 
 
 def find_arduino_port() -> str | None:
@@ -238,6 +284,15 @@ class PedalLink:
         self.fault_reason: str | None = None
         self.last_ok_s = time.monotonic()
 
+        # E-stop state mirrored from the Mega. ``estop_active`` flips True
+        # the instant we parse ``EVT,ESTOP,1`` from the serial stream. The
+        # main loop checks this and bails so steering gets idled — the
+        # firmware already forces brake=MAX and gas=MIN on its side, but
+        # we also need to stop commanding the ODrive or the motor will
+        # fight the brake until the watchdog takes over.
+        self.estop_active = False
+        self._rx_buf = bytearray()
+
         if dry_run:
             print("[pedals] dry-run: commands will NOT be sent over serial.")
             return
@@ -289,6 +344,45 @@ class PedalLink:
             self.last_ok_s = time.monotonic()
         except Exception as e:  # SerialException, OSError, etc — all fatal
             self._mark_fault(f"serial write failed: {e!r}")
+
+    def poll(self) -> None:
+        """Drain any pending bytes from the Mega and handle event lines.
+
+        The firmware emits ``EVT,ESTOP,1`` on press and ``EVT,ESTOP,0`` on
+        release, plus ``STAT,...`` at 10 Hz with a trailing ``es=0|1``
+        field. We only act on the EVT lines here — STAT is ignored by the
+        host (the firmware is authoritative on pedal targets). Called
+        every frame from the main loop; non-blocking.
+        """
+        if self.dry_run or self.ser is None or self.faulted:
+            return
+        try:
+            pending = self.ser.in_waiting
+        except Exception as e:
+            self._mark_fault(f"in_waiting failed: {e!r}")
+            return
+        if pending <= 0:
+            return
+        try:
+            self._rx_buf.extend(self.ser.read(pending))
+        except Exception as e:
+            self._mark_fault(f"serial read failed: {e!r}")
+            return
+        while b"\n" in self._rx_buf:
+            line, _, rest = self._rx_buf.partition(b"\n")
+            self._rx_buf = bytearray(rest)
+            text = line.decode("ascii", errors="replace").strip()
+            if not text:
+                continue
+            if text.startswith("EVT,ESTOP,"):
+                active = text.endswith(",1")
+                if active != self.estop_active:
+                    self.estop_active = active
+                    state = "ENGAGED" if active else "released"
+                    print(f"[pedals] E-STOP {state} (from Mega: {text})")
+            elif text.startswith("ERR,") or text.startswith("INFO,"):
+                # Surface firmware-side warnings/info; STAT is too noisy.
+                print(f"[mega] {text}")
 
     def stop(self) -> None:
         """Best-effort 'release both pedals NOW' on the way out.
@@ -365,6 +459,7 @@ class SteeringLink:
         self._saved_current_hard = None
         self._prev_target_motor = 0.0
         self._prev_vel_cmd_motor = 0.0
+        self._watchdog_enabled = False
 
         if dry_run:
             print("[steering] dry-run: ODrive will NOT be opened.")
@@ -383,6 +478,24 @@ class SteeringLink:
             f"[steering] connected: serial {self.odrv.serial_number}, "
             f"bus {self.odrv.vbus_voltage:.1f}V"
         )
+
+        # Disable any residual watchdog BEFORE clear_errors / setup. If a
+        # previous session died without running stop() (e.g. USB got yanked
+        # mid-drive), ``enable_watchdog`` is still True on the ODrive. The
+        # setup pauses below would then consume the 300 ms window and the
+        # watchdog would re-trip before we entered CLOSED_LOOP_CONTROL,
+        # leaving the axis stuck IDLE with disarm_reason=WATCHDOG.
+        self._axis_cfg = _odrive_cfg(self.axis)
+        self._watchdog_available = (
+            hasattr(self._axis_cfg, "enable_watchdog")
+            and hasattr(self.axis, "watchdog_feed")
+        )
+        if self._watchdog_available:
+            try:
+                self.axis.watchdog_feed()        # pet in case it's about to trip
+                self._axis_cfg.enable_watchdog = False
+            except Exception as e:
+                print(f"[steering] couldn't quiet residual watchdog: {e!r}")
 
         if self.axis.active_errors != 0:
             print(f"[steering] clearing active errors: {self.axis.active_errors}")
@@ -431,6 +544,27 @@ class SteeringLink:
             f"[steering] zero reference = {self.start_pos:.4f} turns "
             f"(whatever the wheel looks like right now is 0°)"
         )
+
+        # Set the watchdog timeout now; enable is deferred to arm_watchdog()
+        # because pygame.display.set_mode() and SysFont on macOS can burn
+        # >300 ms, which would trip the watchdog before we ever commanded
+        # a position. main() calls arm_watchdog() once the control loop is
+        # about to spin.
+        if self._watchdog_available:
+            try:
+                if hasattr(self._axis_cfg, "watchdog_timeout"):
+                    self._axis_cfg.watchdog_timeout = STEERING_WATCHDOG_S
+                print(
+                    f"[steering] axis watchdog configured "
+                    f"(timeout={STEERING_WATCHDOG_S * 1000:.0f} ms, "
+                    f"enabled later by arm_watchdog())"
+                )
+            except Exception as e:
+                self._watchdog_available = False
+                print(f"[steering] watchdog config failed: {e!r}")
+        else:
+            print("[steering] axis watchdog not available on this firmware — "
+                  "USB-drop safety limited to Mega heartbeat.")
 
     def column_deg_estimate(self) -> float:
         """Column angle (deg) relative to startup, from encoder."""
@@ -490,15 +624,79 @@ class SteeringLink:
         self._prev_target_motor = target_motor
 
         self.axis.controller.input_pos = self.start_pos + target_motor
+
+        # Pet the axis watchdog each frame — otherwise the ODrive idles
+        # itself ~STEERING_WATCHDOG_S from now. That's the whole point of
+        # the watchdog, so we only feed while actively driving.
+        if self._watchdog_enabled:
+            try:
+                self.axis.watchdog_feed()
+            except Exception:
+                pass
+
         dem = self._current_demand(
             lx, dlx_dt, vel_cmd_motor, self._prev_vel_cmd_motor, dt_s,
         )
         self._prev_vel_cmd_motor = vel_cmd_motor
         self._apply_dynamic_current(dem)
 
+    def arm_watchdog(self) -> None:
+        """Enable the axis watchdog. Must be called immediately before the
+        main control loop starts feeding, so the ~300 ms window isn't
+        consumed by host-side setup (pygame display init, SysFont, etc.).
+        """
+        if self.dry_run or self.axis is None or not self._watchdog_available:
+            return
+        try:
+            self.axis.watchdog_feed()  # prime
+            self._axis_cfg.enable_watchdog = True
+            self._watchdog_enabled = True
+            print(
+                f"[steering] axis watchdog ARMED @ "
+                f"{STEERING_WATCHDOG_S * 1000:.0f} ms "
+                f"(ODrive will IDLE if host goes silent)"
+            )
+        except Exception as e:
+            print(f"[steering] watchdog arm failed: {e!r}")
+
+    def rebase_zero(self) -> float:
+        """Make the wheel's current encoder position the new 0°.
+
+        Triangle during drive uses this when the operator has rotated the
+        wheel mechanically (e.g. jogged it by hand, recovered from a trip)
+        and wants to re-define "straight" without restarting the script.
+
+        Also commands ``input_pos`` to the new zero and resets the internal
+        target memory so the trap-traj planner doesn't keep slewing toward
+        the old reference.
+        """
+        if self.dry_run or self.axis is None:
+            self.start_pos = 0.0
+            self._prev_target_motor = 0.0
+            self._prev_vel_cmd_motor = 0.0
+            return 0.0
+        self.start_pos = float(self.axis.pos_estimate)
+        self._prev_target_motor = 0.0
+        self._prev_vel_cmd_motor = 0.0
+        try:
+            self.axis.controller.input_pos = self.start_pos
+            if self._watchdog_enabled:
+                self.axis.watchdog_feed()
+        except Exception as e:
+            print(f"[steering] rebase_zero: controller write failed: {e!r}")
+        return self.start_pos
+
     def stop(self) -> None:
         if self.dry_run or self.axis is None:
             return
+        # Disable the watchdog first so our own IDLE transition isn't a
+        # race against the watchdog's auto-idle. No-op if it wasn't armed.
+        if self._watchdog_enabled:
+            try:
+                self._axis_cfg.enable_watchdog = False
+            except Exception:
+                pass
+            self._watchdog_enabled = False
         try:
             self.axis.controller.input_pos = self.start_pos
             time.sleep(0.25)
@@ -597,7 +795,8 @@ def draw_ui(screen, font, font_small, state: dict) -> None:
         screen.blit(font_small.render(hb_text, True, hb_color), (18, y + 6))
 
     hint = font_small.render(
-        "Esc / Q / close window → graceful stop.", True, MUTED,
+        "△ Triangle → rezero steering     •     Esc / Q / close window → graceful stop.",
+        True, MUTED,
     )
     screen.blit(hint, (18, WINDOW_H - 26))
     pygame.display.flip()
@@ -688,6 +887,14 @@ def main() -> int:
         prev_lx = 0.0
         last_mono = time.monotonic()
         running = True
+
+        # Arm the ODrive watchdog *now*, immediately before the feed loop
+        # starts — all the heavyweight pygame/font setup above is already
+        # done, so the first watchdog_feed() inside command_deg() lands
+        # well within STEERING_WATCHDOG_S of this enable.
+        if steering is not None:
+            steering.arm_watchdog()
+
         while running:
             for event in pygame.event.get():
                 if event.type == pygame.QUIT:
@@ -697,6 +904,37 @@ def main() -> int:
                 elif event.type == pygame.JOYDEVICEREMOVED:
                     print("[ps5] controller disconnected — stopping.")
                     running = False
+                elif event.type == pygame.JOYBUTTONDOWN and event.button == BUTTON_TRIANGLE:
+                    # Triangle → re-zero the steering reference to whatever
+                    # the wheel looks like right now. Integrated mode's
+                    # target angle is also reset so the trap planner doesn't
+                    # yank the wheel back to the old zero.
+                    if control_steering and steering is not None:
+                        new_zero = steering.rebase_zero()
+                        steer_target_deg = 0.0
+                        print(
+                            f"[steering] △ Triangle: zero rebased to "
+                            f"{new_zero:.4f} turns (wheel is now 0°)"
+                        )
+
+            # Drain any telemetry/events from the Mega (EVT,ESTOP,...).
+            # Done before the liveness check so an e-stop press is handled
+            # even on the frame the controller also drops.
+            if pedals is not None:
+                pedals.poll()
+                if pedals.estop_active:
+                    print("[main] E-STOP engaged on Mega — idling steering.")
+                    running = False
+                    break
+
+            # Proactive liveness check: SDL sometimes misses silent BT drops.
+            # Break out before we read axes so the finally-block gets to send
+            # S to the Mega; don't wait for the firmware heartbeat to expire.
+            alive, reason = controller_alive(js)
+            if not alive:
+                print(f"[ps5] controller lost ({reason}) — retracting pedals.")
+                running = False
+                break
 
             lx_raw = js.get_axis(AXIS_LEFT_X) if js.get_numaxes() > AXIS_LEFT_X else 0.0
             lx = apply_deadzone(lx_raw, STEER_STICK_DEADZONE)

@@ -45,8 +45,8 @@ BRAKE_POT_MAX = 0.45  # full brake (mechanical limit of the actuator vs. pedal)
 # Per-actuator PWM duty (0..255) while moving. Higher = faster actuator
 # travel. The BTS7960 is a full H-bridge and the actuators are 12V-rated,
 # so 255 = full rail is safe; pick a lower value if you want softer motion.
-GAS_ACTUATOR_PWM = 230
-BRAKE_ACTUATOR_PWM = 230
+GAS_ACTUATOR_PWM = 255
+BRAKE_ACTUATOR_PWM = 255
 
 
 # --- Gas authority hierarchy ------------------------------------------------
@@ -81,8 +81,8 @@ STEERING_BELT_RATIO = 3.0
 # Soft angle limits measured AT THE STEERING COLUMN (same frame as the
 # steering wheel). Provisional ±90° until the mechanical lock-to-lock range
 # is measured — see the open TODO in docs/steering.md.
-STEERING_MIN_DEG = -90.0
-STEERING_MAX_DEG = 90.0
+STEERING_MIN_DEG = -180.0
+STEERING_MAX_DEG = 180.0
 
 
 def steering_deg_to_motor_turns(column_deg: float) -> float:
