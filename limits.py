@@ -42,6 +42,12 @@ GAS_POT_MAX = 0.68   # full throttle (mechanical hard stop of the actuator)
 BRAKE_POT_MIN = 0.00  # resting / fully released
 BRAKE_POT_MAX = 0.45  # full brake (mechanical limit of the actuator vs. pedal)
 
+# Per-actuator PWM duty (0..255) while moving. Higher = faster actuator
+# travel. The BTS7960 is a full H-bridge and the actuators are 12V-rated,
+# so 255 = full rail is safe; pick a lower value if you want softer motion.
+GAS_ACTUATOR_PWM = 230
+BRAKE_ACTUATOR_PWM = 230
+
 
 # --- Gas authority hierarchy ------------------------------------------------
 #
@@ -58,7 +64,7 @@ GLOBAL_SPEED_LIMIT = 0.45
 # What full-squeeze R2 on the DualSense is allowed to command when the
 # PS5 script is driving. Stays below GLOBAL_SPEED_LIMIT so that tightening
 # the global knob always wins.
-PS5_GAS_LIMIT = 0.40
+PS5_GAS_LIMIT = GLOBAL_SPEED_LIMIT
 
 # Cap used by the autonomy stack. At the bottom of the hierarchy on
 # purpose: the robot should drive slower than a human operator until it

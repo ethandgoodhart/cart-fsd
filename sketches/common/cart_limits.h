@@ -7,6 +7,8 @@
 #ifndef CART_LIMITS_H
 #define CART_LIMITS_H
 
+#include <stdint.h>
+
 // ---- Pedal linear actuators (normalized pot reading 0.0..1.0) ---------------
 // See docs/linear_actuators.md.
 
@@ -17,6 +19,10 @@ static const float GAS_POT_MAX   = 0.68f;  // full throttle
 // Brake pedal (pot on A0)
 static const float BRAKE_POT_MIN = 0.00f;  // resting / fully released
 static const float BRAKE_POT_MAX = 0.45f;  // full brake (mechanical limit)
+
+// PWM duty (0..255) for each actuator while moving — higher = faster.
+static const uint8_t GAS_ACTUATOR_PWM   = 230;
+static const uint8_t BRAKE_ACTUATOR_PWM = 230;
 
 
 // ---- Steering (ODrive S1 + M8325s through HTD 5M belt) ----------------------

@@ -52,9 +52,8 @@ const int BRAKE_L_PWM = 5;
 const int BRAKE_POT   = A0;
 
 // ---- Control tuning -----------------------------------------------------
-// PWM duty when the actuator is moving. The existing test sketches use 80;
-// tune up/down once we measure how well bang-bang tracks a moving target.
-const uint8_t PWM_SPEED = 80;
+// PWM duty per pedal while moving (0..255). Pulled from cart_limits.h so
+// limits.py stays the single source of truth.
 
 // Deadband around the target (same units as the pot: 0..1 normalized).
 // If |pot - target| < DEADBAND the actuator is stopped, so we don't
@@ -79,6 +78,7 @@ struct Pedal {
   // Pin config
   int r_en, r_pwm, l_en, l_pwm, pot_pin;
   float pot_min, pot_max;
+  uint8_t pwm_speed;
   // State
   float target;       // where we want to be (normalized pot units)
   float pot;          // most-recent pot reading
@@ -86,9 +86,11 @@ struct Pedal {
 };
 
 Pedal gas   = { "gas",   GAS_R_EN,   GAS_R_PWM,   GAS_L_EN,   GAS_L_PWM,   GAS_POT,
-                GAS_POT_MIN,   GAS_POT_MAX,   GAS_POT_MIN,   0.0f, DIR_STOP };
+                GAS_POT_MIN,   GAS_POT_MAX,   GAS_ACTUATOR_PWM,
+                GAS_POT_MIN,   0.0f, DIR_STOP };
 Pedal brake = { "brake", BRAKE_R_EN, BRAKE_R_PWM, BRAKE_L_EN, BRAKE_L_PWM, BRAKE_POT,
-                BRAKE_POT_MIN, BRAKE_POT_MAX, BRAKE_POT_MIN, 0.0f, DIR_STOP };
+                BRAKE_POT_MIN, BRAKE_POT_MAX, BRAKE_ACTUATOR_PWM,
+                BRAKE_POT_MIN, 0.0f, DIR_STOP };
 
 unsigned long last_host_byte_ms = 0;
 unsigned long last_status_ms    = 0;
@@ -107,13 +109,13 @@ void driveStop(Pedal &p) {
 
 void driveForward(Pedal &p) {   // press pedal (engage)
   analogWrite(p.r_pwm, 0);
-  analogWrite(p.l_pwm, PWM_SPEED);
+  analogWrite(p.l_pwm, p.pwm_speed);
   p.dir = DIR_FORWARD;
 }
 
 void driveBackward(Pedal &p) {  // release pedal (retract)
   analogWrite(p.l_pwm, 0);
-  analogWrite(p.r_pwm, PWM_SPEED);
+  analogWrite(p.r_pwm, p.pwm_speed);
   p.dir = DIR_BACKWARD;
 }
 
@@ -156,14 +158,16 @@ void handleCommand(char *cmd) {
     case 'G': {
       float v = atof(cmd + 1);
       if (v < 0.0f) v = 0.0f;
-      if (v > GAS_POT_MAX) { Serial.print(F("ERR,gas over cap: ")); Serial.println(v, 3); v = GAS_POT_MAX; }
+      if (v > GAS_POT_MAX + 1e-4f) { Serial.print(F("ERR,gas over cap: ")); Serial.println(v, 3); }
+      if (v > GAS_POT_MAX) v = GAS_POT_MAX;
       gas.target = v;
       break;
     }
     case 'B': {
       float v = atof(cmd + 1);
       if (v < 0.0f) v = 0.0f;
-      if (v > BRAKE_POT_MAX) { Serial.print(F("ERR,brake over cap: ")); Serial.println(v, 3); v = BRAKE_POT_MAX; }
+      if (v > BRAKE_POT_MAX + 1e-4f) { Serial.print(F("ERR,brake over cap: ")); Serial.println(v, 3); }
+      if (v > BRAKE_POT_MAX) v = BRAKE_POT_MAX;
       brake.target = v;
       break;
     }
