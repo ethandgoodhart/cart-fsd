@@ -22,9 +22,11 @@
         </div>
         <div class="top-center">
             <div class="autopilot-badge">
-                <img class="ap-icon" src="{{ url_for('static', filename='img/ps5-controller.png') }}" alt="" aria-hidden="true" />
+                <span class="ap-icon-wrap">
+                    <img class="ap-icon" src="{{ url_for('static', filename='img/ps5-controller.png') }}" alt="" aria-hidden="true" />
+                    <span class="status-dot" id="controller-dot" title="Controller"></span>
+                </span>
                 <span>Controller Mode</span>
-                <span class="status-dot" id="controller-dot" title="Controller"></span>
             </div>
             <div class="hw-status" id="hw-status">
                 <span class="hw-item" id="hw-motor" title="Motor / ODrive">
@@ -179,11 +181,17 @@
                 const r = await fetch('/state', { cache: 'no-store' });
                 if (!r.ok) return;
                 const s = await r.json();
-                speedEl.textContent = Math.round(Number(s.mph) || 0);
+                const mph = Number(s.mph) || 0;
+                speedEl.textContent = Math.round(mph);
+                // Published for scene.js's animate loop to slide the
+                // lane markers down the road at an MPH-proportional rate.
+                window.__mph = mph;
 
                 const steerDeg = Number(s.steer_deg) || 0;
                 wheelEl.style.transform = `rotate(${steerDeg}deg)`;
                 angleEl.textContent = `${steerDeg >= 0 ? '+' : ''}${steerDeg.toFixed(0)}°`;
+                // Published for scene.js to bend the predicted path.
+                window.__steerDeg = steerDeg;
 
                 updatePedalStack(
                     Math.max(0, Math.min(1, Number(s.gas_frac) || 0)),

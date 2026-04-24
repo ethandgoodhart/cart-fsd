@@ -993,12 +993,25 @@ def main() -> int:
     exit_code = 0
 
     try:
+        # Graceful degrade: if either hardware init fails, keep the loop
+        # running so the controller still shows as connected in the web
+        # UI. Main-loop guards already skip send/command for missing
+        # subsystems — the state file records arduino_connected /
+        # motor_connected honestly.
         if control_pedals:
-            pedals = PedalLink(args.arduino_port, dry_run=args.dry_run)
+            try:
+                pedals = PedalLink(args.arduino_port, dry_run=args.dry_run)
+            except Exception as e:
+                print(f"[main] pedals init failed: {e} — running without Arduino.")
+                pedals = None
         if control_steering:
-            steering = SteeringLink(
-                dry_run=args.dry_run, stick_steering=args.stick_steering,
-            )
+            try:
+                steering = SteeringLink(
+                    dry_run=args.dry_run, stick_steering=args.stick_steering,
+                )
+            except Exception as e:
+                print(f"[main] steering init failed: {e} — running without ODrive.")
+                steering = None
 
         if args.headless:
             # set_mode is still needed so SDL's event queue pumps —

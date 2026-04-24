@@ -72,29 +72,36 @@ shoulder.receiveShadow = true;
 scene.add(shoulder);
 
 // ---------- Lane lines ----------
+// Dashes are tracked so animate() can slide them down the road,
+// producing the illusion of the cart moving forward. Wrapping keeps
+// the visible stretch full no matter how long the simulation runs.
+const DASH_LEN = 2.2;
+const DASH_GAP = 2.6;
+const DASH_STRIDE = DASH_LEN + DASH_GAP;
+const DASH_Z_FAR = -roadLength + 18;              // spawn boundary (behind cart)
+const DASH_Z_NEAR = DASH_Z_FAR + roadLength;      // wrap boundary (past camera)
+const laneDashes = [];
+
 function addLine({ x, dashed = false, color = 0x1a1b1f, width = 0.18 }) {
     const length = roadLength;
-    const z0 = -roadLength + 18;
     if (!dashed) {
         const m = new THREE.Mesh(
             new THREE.PlaneGeometry(width, length),
             new THREE.MeshBasicMaterial({ color })
         );
         m.rotation.x = -Math.PI / 2;
-        m.position.set(x, 0.012, z0 + length / 2);
+        m.position.set(x, 0.012, DASH_Z_FAR + length / 2);
         scene.add(m);
     } else {
-        const dashLen = 2.2;
-        const gap = 2.6;
-        const total = dashLen + gap;
-        const count = Math.floor(length / total);
-        const geo = new THREE.PlaneGeometry(width, dashLen);
+        const count = Math.floor(length / DASH_STRIDE);
+        const geo = new THREE.PlaneGeometry(width, DASH_LEN);
         const mat = new THREE.MeshBasicMaterial({ color });
         for (let i = 0; i < count; i++) {
             const m = new THREE.Mesh(geo, mat);
             m.rotation.x = -Math.PI / 2;
-            m.position.set(x, 0.012, z0 + i * total + dashLen / 2);
+            m.position.set(x, 0.012, DASH_Z_FAR + i * DASH_STRIDE + DASH_LEN / 2);
             scene.add(m);
+            laneDashes.push(m);
         }
     }
 }
@@ -106,37 +113,93 @@ addLine({ x: -roadWidth / 6, dashed: true, color: 0x9aa0a8, width: 0.16 });
 addLine({ x: roadWidth / 6, dashed: true, color: 0x9aa0a8, width: 0.16 });
 
 // ---------- Tesla-style predicted path (two glowing blue strips) ----------
-function pathStrip(offsetX) {
-    const pts = [];
-    const segs = 60;
-    for (let i = 0; i <= segs; i++) {
-        const t = i / segs;
-        const z = 1.5 + -t * 70;
-        const x = offsetX + Math.sin(t * 2.2) * 0.12;
-        pts.push(new THREE.Vector3(x, 0.03, z));
-    }
-    const curve = new THREE.CatmullRomCurve3(pts);
-    const geo = new THREE.TubeGeometry(curve, 80, 0.07, 8, false);
-    const mat = new THREE.MeshBasicMaterial({
-        color: 0x1f6feb,
-        transparent: true,
-        opacity: 0.9
-    });
-    const mesh = new THREE.Mesh(geo, mat);
-    scene.add(mesh);
+// The strips bend in response to steering — the near end stays pinned
+// just in front of the cart while the far end swings by a fraction of
+// the steer angle. Geometry is rebuilt when steer changes meaningfully;
+// 60fps rebuilds of a ~80-seg tube are cheap on any recent GPU.
+const PATH_SEGS = 60;
+const PATH_TUBE_SEGS = 80;
+const PATH_LENGTH = 70;
+const pathStrips = [];
 
-    const halo = new THREE.Mesh(
-        new THREE.TubeGeometry(curve, 80, 0.22, 8, false),
-        new THREE.MeshBasicMaterial({
-            color: 0x4b8dff,
-            transparent: true,
-            opacity: 0.12
-        })
+function buildPathCurve(offsetX, steerDeg) {
+    // Drive the bend from steering angle. At ±45° the far end sweeps
+    // ~7 world-units laterally — enough to read as a decisive turn but
+    // not so far it leaves the frame. Sign flip: positive steerDeg is
+    // a right turn, which should curve the path to +x.
+    const lateral = (steerDeg / 45) * 7;
+    const pts = [];
+    for (let i = 0; i <= PATH_SEGS; i++) {
+        const t = i / PATH_SEGS;
+        const z = 1.5 - t * PATH_LENGTH;
+        // Quadratic bend: pinned at the cart, full offset at the horizon.
+        // No per-segment jitter — tiny wiggles make TubeGeometry's Frenet
+        // frames flip and render the tube inside-out in patches.
+        const bend = (t * t) * lateral;
+        pts.push(new THREE.Vector3(offsetX + bend, 0.09, z));
+    }
+    return new THREE.CatmullRomCurve3(pts);
+}
+
+function pathStrip(offsetX) {
+    const curve = buildPathCurve(offsetX, 0);
+    // Core is opaque — transparency is what was causing the strips to
+    // drop out intermittently. Transparent meshes sort by centroid Z,
+    // so whenever a scrolling lane dash's centroid happened to be
+    // closer to the camera than the long tube's centroid, the dash
+    // drew on top and occluded sections of the strip.
+    // DoubleSide covers the other intermittent failure (Frenet frame
+    // flips on curved tubes rendering the inside face toward camera).
+    const coreMat = new THREE.MeshBasicMaterial({
+        color: 0x1f6feb,
+        side: THREE.DoubleSide,
+    });
+    // Halo stays transparent; renderOrder pins it above everything so
+    // the transparent-sort glitch can't bite it either.
+    const haloMat = new THREE.MeshBasicMaterial({
+        color: 0x4b8dff, transparent: true, opacity: 0.12,
+        side: THREE.DoubleSide,
+        depthWrite: false,
+    });
+    const core = new THREE.Mesh(
+        new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, 0.07, 8, false), coreMat,
     );
+    const halo = new THREE.Mesh(
+        new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, 0.22, 8, false), haloMat,
+    );
+    core.renderOrder = 2;
+    halo.renderOrder = 1;
+    scene.add(core);
     scene.add(halo);
+    pathStrips.push({ offsetX, core, halo });
 }
 pathStrip(-0.85);
 pathStrip(0.85);
+
+// State polls arrive at ~12 Hz but animate runs at ~60 Hz — without a
+// filter the path snaps between steering samples. A low-pass toward
+// the target angle turns each state update into a smooth sweep.
+// TAU is the time constant: ~63% of the gap is closed in TAU seconds.
+const STEER_SMOOTH_TAU = 0.11;
+let lastSteerDeg = 0;
+let displaySteerDeg = 0;
+function updatePaths(targetSteerDeg, dt) {
+    const alpha = 1 - Math.exp(-dt / STEER_SMOOTH_TAU);
+    displaySteerDeg += (targetSteerDeg - displaySteerDeg) * alpha;
+    // Skip rebuilds once we've essentially converged — avoids pointless
+    // GPU churn when the stick is centered and the filter has settled.
+    if (Math.abs(displaySteerDeg - lastSteerDeg) < 0.08) return;
+    lastSteerDeg = displaySteerDeg;
+    for (const strip of pathStrips) {
+        const curve = buildPathCurve(strip.offsetX, displaySteerDeg);
+        const nextCore = new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, 0.07, 8, false);
+        const nextHalo = new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, 0.22, 8, false);
+        strip.core.geometry.dispose();
+        strip.halo.geometry.dispose();
+        strip.core.geometry = nextCore;
+        strip.halo.geometry = nextHalo;
+    }
+}
 
 // ============ GOLF CART ============
 const cart = new THREE.Group();
@@ -393,10 +456,37 @@ contact.position.y = 0.005;
 scene.add(contact);
 
 // ---------- Animate ----------
+// window.__mph is updated by pollState() in the page script; we read
+// it here without coupling the two files. Units: world-units per second
+// per MPH. 0.45 puts 20 MPH at one lane dash (~4.8 units) every ~0.55 s,
+// which reads as a relaxed, matches-the-camera-height cruise.
+const SPEED_WORLD_PER_MPH = 0.79;
+
 let t = 0;
-function animate() {
-    t += 0.016;
+let prevFrame = performance.now();
+function animate(now) {
+    if (now === undefined) now = performance.now();
+    const dt = Math.min(0.05, (now - prevFrame) / 1000);
+    prevFrame = now;
+    t += dt;
     cart.position.y = Math.sin(t * 2.0) * 0.008;
+
+    updatePaths(Number(window.__steerDeg) || 0, dt);
+
+    const mph = Math.max(0, Number(window.__mph) || 0);
+    if (mph > 0) {
+        const slide = mph * SPEED_WORLD_PER_MPH * dt;
+        // Each lane has laneDashes.length / 2 dashes tiled at DASH_STRIDE
+        // spacing, so that product is the per-lane repeat distance.
+        const wrap = (laneDashes.length / 2) * DASH_STRIDE;
+        for (const m of laneDashes) {
+            m.position.z += slide;
+            if (m.position.z > DASH_Z_NEAR) {
+                m.position.z -= wrap;
+            }
+        }
+    }
+
     renderer.render(scene, camera);
     requestAnimationFrame(animate);
 }

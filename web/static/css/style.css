@@ -90,22 +90,32 @@ html, body {
     backdrop-filter: blur(16px);
     -webkit-backdrop-filter: blur(16px);
 }
+.ap-icon-wrap {
+    position: relative;
+    display: inline-flex;
+    flex-shrink: 0;
+}
 .ap-icon { width: 26px; height: auto; flex-shrink: 0; display: block; object-fit: contain; }
 
-/* Connection indicator dot on the Controller Mode pill. Gray by default,
-   flips to a light green when controller_connected is reported true. */
+/* Connection indicator dot pinned to the bottom-right of the PS5
+   controller glyph. White ring lifts it off the icon so it reads
+   against either a light or dark background. */
 .status-dot {
-    width: 8px;
-    height: 8px;
+    position: absolute;
+    left: 50%;
+    bottom: -2px;
+    transform: translateX(-50%);
+    width: 7px;
+    height: 7px;
     border-radius: 50%;
     background: #c9ccd3;
-    margin-left: 4px;
+    border: 1.5px solid #ffffff;
     transition: background-color 180ms ease, box-shadow 180ms ease;
-    flex-shrink: 0;
+    pointer-events: none;
 }
 .status-dot.connected {
     background: #7ed488;
-    box-shadow: 0 0 0 2px rgba(126, 212, 136, 0.18);
+    box-shadow: 0 0 0 2px rgba(126, 212, 136, 0.22);
 }
 
 /* Compact motor / arduino status cluster under the pill. */
