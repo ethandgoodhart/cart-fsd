@@ -78,9 +78,13 @@ FSD_GAS_LIMIT = 0.25
 # 3 motor turns = 1 full turn of the steering column / steering wheel.
 STEERING_BELT_RATIO = 3.0
 
-# Soft angle limits measured AT THE STEERING COLUMN (same frame as the
-# steering wheel). Provisional ±90° until the mechanical lock-to-lock range
-# is measured — see the open TODO in docs/steering.md.
+# Soft angle limits measured AT THE STEERING COLUMN. Cart's rack
+# physically supports ~±270° lock-to-lock; live we observed the wheel
+# refusing to track past ±80° even though no mechanical stop was hit —
+# almost certainly an ODrive vel_limit/current_limit choking the motor
+# against the rising rack-load near full lock. Keeping the soft cap at
+# the full mechanical range; see ps5_drive.py for the current/vel
+# unblock attempts.
 STEERING_MIN_DEG = -270.0
 STEERING_MAX_DEG = 270.0
 

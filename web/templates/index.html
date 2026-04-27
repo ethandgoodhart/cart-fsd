@@ -4,9 +4,7 @@
     <meta charset="UTF-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>FSD · Golf Cart</title>
-    <link rel="preconnect" href="https://fonts.googleapis.com">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=Playfair+Display:ital,wght@0,600;0,700;1,700&display=swap" rel="stylesheet">
+    <link href="{{ url_for('static', filename='vendor/fonts/fonts.css') }}" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
 <body>
@@ -108,11 +106,74 @@
         <div class="indicator-dot"></div>
     </div>
 
+    <!-- Autoware status + predicted angle readout -->
+    <div class="autoware-hud" id="autoware-hud">
+        <span class="aw-status-dot"></span>
+        <span id="aw-status-text">IDLE</span>
+        <span class="aw-angle" id="aw-angle">—</span>
+        <span id="aw-fps">—</span>
+    </div>
+
+    <!-- 4x2 stream grid.
+         Row 1: raw cameras (slugs match scripts/autoware_infer.py::SLUGS).
+         Row 2: Autoware model outputs — lanes / depth / objects / seg —
+                shown only while Autoware viz is publishing.
+         Each <img> is fed by snapshot polling (see refreshTiles below):
+         short-lived /cam/<slug>.jpg requests with a cache-busting param.
+         We deliberately AVOID the MJPEG endpoint here because Firefox
+         caps long-lived connections at 6 per host — 8 streams + /state
+         polling would push some tiles into a queued state that freezes
+         them once the persistent socket eventually drops. -->
+    <div class="cam-grid" id="cam-grid">
+        <!-- Row 1: cameras -->
+        <div class="cam-tile" data-cam="front_wide">
+            <img alt="" />
+            <div class="cam-label">Front Wide</div>
+            <div class="cam-badge">AUTOWARE</div>
+        </div>
+        <div class="cam-tile" data-cam="front_narrow">
+            <img alt="" />
+            <div class="cam-label">Front Narrow</div>
+            <div class="cam-badge">AUTOWARE</div>
+        </div>
+        <div class="cam-tile" data-cam="left">
+            <img alt="" />
+            <div class="cam-label">Left</div>
+            <div class="cam-badge">AUTOWARE</div>
+        </div>
+        <div class="cam-tile" data-cam="right">
+            <img alt="" />
+            <div class="cam-label">Right</div>
+            <div class="cam-badge">AUTOWARE</div>
+        </div>
+
+        <!-- Row 2: model outputs. Hidden until Autoware viz is live. -->
+        <div class="cam-tile viz-tile" data-cam="lanes">
+            <img alt="" />
+            <div class="cam-label">Lanes</div>
+            <div class="cam-pending">model loading…</div>
+        </div>
+        <div class="cam-tile viz-tile" data-cam="depth">
+            <img alt="" />
+            <div class="cam-label">Depth</div>
+            <div class="cam-pending">model loading…</div>
+        </div>
+        <div class="cam-tile viz-tile" data-cam="objects">
+            <img alt="" />
+            <div class="cam-label">Obstacles</div>
+            <div class="cam-pending">model loading…</div>
+        </div>
+        <div class="cam-tile viz-tile" data-cam="seg">
+            <img alt="" />
+            <div class="cam-label">Segmentation</div>
+            <div class="cam-pending">model loading…</div>
+        </div>
+    </div>
+
     <script type="importmap">
     {
         "imports": {
-            "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
-            "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+            "three": "{{ url_for('static', filename='vendor/three/three.module.js') }}"
         }
     }
     </script>
@@ -176,6 +237,95 @@
             el.classList.toggle('connected', !!connected);
         }
 
+        // Autoware HUD + camera tile indicator.
+        const awHud = document.getElementById('autoware-hud');
+        const awStatus = document.getElementById('aw-status-text');
+        const awAngle = document.getElementById('aw-angle');
+        const awFps = document.getElementById('aw-fps');
+        const camTiles = {};
+        const vizTiles = [];
+        document.querySelectorAll('.cam-tile').forEach(el => {
+            camTiles[el.dataset.cam] = el;
+            if (el.classList.contains('viz-tile')) vizTiles.push(el);
+        });
+
+        // Snapshot polling.
+        // Each <img> requests /cam/<slug>.jpg?t=<timestamp> on a fixed
+        // interval. Short-lived HTTP exchanges only — no persistent MJPEG
+        // sockets, so Firefox's per-host connection cap (6) doesn't choke
+        // us with 8 simultaneous streams. The cache-buster on `t` keeps the
+        // browser from serving a stale image from disk cache.
+        // Refresh rate matches autoware_infer's JPEG publish cadence (~15
+        // Hz) so we don't poll faster than new frames are produced.
+        const FRAME_REFRESH_MS = 80;
+        function refreshTiles() {
+            const t = Date.now();
+            for (const slug in camTiles) {
+                const el = camTiles[slug];
+                // Skip viz tiles that haven't been declared ready —
+                // requesting a non-existent /cam/lanes.jpg returns 404 and
+                // would just fill the console with noise.
+                if (el.classList.contains('viz-tile')
+                        && !el.classList.contains('viz-ready')) {
+                    continue;
+                }
+                const img = el.querySelector('img');
+                if (img) img.src = `/cam/${slug}.jpg?t=${t}`;
+            }
+        }
+        refreshTiles();
+        setInterval(refreshTiles, FRAME_REFRESH_MS);
+
+        function updateAutoware(s) {
+            const aw = s.autoware || {};
+            const running = !!aw.running;
+            // Precedence — ps5_drive's authoritative status wins when present,
+            // else we infer from the running flag so the UI is still useful
+            // when ps5_drive isn't launched with --autosteer.
+            let status = (s.autosteer_status || (running ? 'autoware' : 'idle'));
+            if (s.human_override) status = 'human';
+            awHud.classList.remove(
+                'status-idle', 'status-autoware', 'status-human', 'status-stale'
+            );
+            awHud.classList.add('status-' + status);
+            awStatus.textContent = status.toUpperCase();
+
+            // Angle shown is what Autoware currently predicts; when idle we
+            // show an em dash because a stale 0° could be misread as "model
+            // thinks we're centered" when really the model isn't running.
+            if (running && aw.inference) {
+                const d = Number(aw.steer_deg) || 0;
+                awAngle.textContent = `${d >= 0 ? '+' : ''}${d.toFixed(0)}°`;
+            } else {
+                awAngle.textContent = '—';
+            }
+            awFps.textContent = aw.fps ? `${aw.fps.toFixed(0)} FPS` : '';
+
+            // Highlight the active camera tile. Only one at a time; when the
+            // inference is off, no tile is highlighted.
+            const active = running && aw.inference ? aw.active_cam : null;
+            for (const [slug, el] of Object.entries(camTiles)) {
+                el.classList.toggle('active', slug === active);
+            }
+            // Viz tiles light up only once the sidecar starts publishing
+            // model outputs (separate flag from inference because we have
+            // a --no-viz mode that runs the steering model alone).
+            const vizLive = !!aw.viz;
+            for (const el of vizTiles) {
+                el.classList.toggle('viz-ready', vizLive);
+            }
+
+            // Recolor the 3D predicted path. Gold the moment Autoware
+            // actually owns the wheel (status === 'autoware'); blue the
+            // instant the human pushes the stick past the deadzone or
+            // when Autoware isn't running. 'stale' / 'idle' fall through
+            // to blue too — gold is reserved for "the model is steering
+            // right now."
+            if (typeof window.__setPathTone === 'function') {
+                window.__setPathTone(status === 'autoware' ? 'autoware' : 'human');
+            }
+        }
+
         async function pollState() {
             try {
                 const r = await fetch('/state', { cache: 'no-store' });
@@ -201,10 +351,12 @@
                 setConnected(controllerDot, s.controller_connected);
                 setConnected(motorItem, s.motor_connected);
                 setConnected(arduinoItem, s.arduino_connected);
+                updateAutoware(s);
             } catch (e) {
                 setConnected(controllerDot, false);
                 setConnected(motorItem, false);
                 setConnected(arduinoItem, false);
+                updateAutoware({});
             }
         }
         pollState();

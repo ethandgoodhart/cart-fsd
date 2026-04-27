@@ -328,7 +328,11 @@ html, body {
     filter: drop-shadow(0 4px 14px rgba(0, 0, 0, 0.08));
 }
 .wheel-svg #wheel-rotate {
-    transform-origin: 50px 50px;
+    /* `fill-box` sets the reference frame to the group's bounding
+       box — `50px 50px` then reads as 50px from its top-left, which is
+       not its center. `center` (within the bbox) puts the pivot
+       exactly at the wheel hub. */
+    transform-origin: center;
     transform-box: fill-box;
     transition: transform 90ms linear;
 }
@@ -370,4 +374,155 @@ html, body {
 @keyframes pedal-pulse {
     0%, 100% { opacity: 0.78; }
     50%      { opacity: 1; }
+}
+
+/* ===== Stream grid (bottom-right) =====
+   4×2 MJPEG tiles. Top row = raw cameras; bottom row = Autoware model
+   outputs (lanes / depth / objects / seg). The tile feeding the
+   inference camera gets a blue ring + AUTOWARE badge. Viz tiles show a
+   "model loading…" placeholder until inference is live. */
+.cam-grid {
+    position: fixed;
+    bottom: 40px;
+    right: 40px;
+    z-index: 10;
+    display: grid;
+    grid-template-columns: repeat(4, 200px);
+    grid-template-rows: repeat(2, 120px);
+    gap: 10px;
+    pointer-events: none;
+}
+
+.cam-tile {
+    position: relative;
+    background: #0b0c0f;
+    border: 1px solid var(--line);
+    border-radius: 10px;
+    overflow: hidden;
+    box-shadow: 0 6px 22px rgba(0, 0, 0, 0.08);
+    transition: border-color 180ms ease, box-shadow 180ms ease;
+}
+.cam-tile.active {
+    border-color: var(--accent);
+    box-shadow: 0 0 0 2px var(--accent-soft), 0 8px 28px rgba(31, 111, 235, 0.22);
+}
+.cam-tile img {
+    display: block;
+    width: 100%;
+    height: 100%;
+    object-fit: cover;
+    background: #0b0c0f;
+}
+.cam-tile .cam-label {
+    position: absolute;
+    top: 8px;
+    left: 10px;
+    font-size: 10px;
+    font-weight: 600;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    color: #ffffff;
+    background: rgba(0, 0, 0, 0.55);
+    padding: 3px 8px;
+    border-radius: 4px;
+}
+.cam-tile .cam-badge {
+    position: absolute;
+    top: 8px;
+    right: 10px;
+    font-size: 10px;
+    font-weight: 700;
+    letter-spacing: 0.18em;
+    color: #ffffff;
+    background: var(--accent);
+    padding: 3px 8px;
+    border-radius: 4px;
+    opacity: 0;
+    transform: translateY(-2px);
+    transition: opacity 160ms ease, transform 160ms ease;
+}
+.cam-tile.active .cam-badge {
+    opacity: 1;
+    transform: translateY(0);
+}
+.cam-tile .cam-offline {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #6d727c;
+    font-size: 11px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+}
+.cam-tile.offline img { opacity: 0; }
+/* The [hidden] attribute on .cam-offline would otherwise lose specificity
+   to the .cam-tile .cam-offline rule above — force it to actually hide. */
+.cam-tile .cam-offline[hidden] { display: none; }
+
+/* Viz-only adjustments: model output tiles never show the AUTOWARE badge
+   (they ARE the model output) and hide their image+label until the
+   inference sidecar publishes the first viz frame. JS toggles
+   .viz-ready on each viz tile based on /state.autoware.viz. */
+.cam-tile.viz-tile .cam-badge { display: none; }
+.cam-tile.viz-tile .cam-pending {
+    position: absolute;
+    inset: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #6d727c;
+    background: #f6f7f9;
+    font-size: 10px;
+    letter-spacing: 0.18em;
+    text-transform: uppercase;
+}
+.cam-tile.viz-tile.viz-ready .cam-pending { display: none; }
+.cam-tile.viz-tile:not(.viz-ready) img { opacity: 0; }
+
+/* Autoware HUD — a small readout above the cam grid with predicted angle
+   + status (autoware/human/stale/idle). Sits where the route-time footer
+   used to, so we don't crowd the speed cluster. */
+.autoware-hud {
+    /* Sits above the 4x2 stream grid: 40 bottom margin + 120*2 rows + 10
+       gap + 12 breathing room = 302. Keep in sync with .cam-grid. */
+    position: fixed;
+    bottom: 302px;
+    right: 40px;
+    z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    pointer-events: none;
+    color: var(--muted);
+    font-size: 11px;
+    letter-spacing: 0.14em;
+    text-transform: uppercase;
+    font-variant-numeric: tabular-nums;
+}
+.autoware-hud .aw-status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #c9ccd3;
+    transition: background-color 180ms ease, box-shadow 180ms ease;
+}
+.autoware-hud.status-autoware .aw-status-dot {
+    background: var(--accent);
+    box-shadow: 0 0 0 3px var(--accent-soft);
+}
+.autoware-hud.status-human .aw-status-dot {
+    background: var(--warn);
+    box-shadow: 0 0 0 3px rgba(255, 138, 0, 0.18);
+}
+.autoware-hud.status-stale .aw-status-dot {
+    background: #d84a4a;
+}
+.autoware-hud .aw-angle {
+    color: var(--ink);
+    font-weight: 600;
+    letter-spacing: 0;
+    font-size: 13px;
+    text-transform: none;
 }

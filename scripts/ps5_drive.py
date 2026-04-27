@@ -56,6 +56,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import sys
 import threading
@@ -145,6 +146,42 @@ PS5_TRAP_DECEL_MAX = 15.0
 # The wheel follows via TRAP_TRAJ; high values let the planner saturate at PS5_TRAP_*.
 STEER_INTEGRATE_RATE_DPS = 320.0
 
+# Self-centering (integrated mode only). When the stick is in the deadzone
+# AND Autoware isn't actively driving, the target angle decays toward 0
+# with this time constant — same trick racing sims use to mimic caster
+# return. ~63% of the offset is removed per TAU seconds; a 0.45 s tau
+# gives a snappy-but-not-twitchy "let go and the wheel comes back" feel.
+# Speeds it up modestly with commanded mph (caster effect grows with
+# speed) so high-speed drift back is faster than at a crawl.
+STEER_RETURN_TAU_REST_S = 0.55
+STEER_RETURN_TAU_FAST_S = 0.30
+STEER_RETURN_REF_MPH = 12.0   # tau interpolates from REST→FAST across 0..ref mph
+STEER_RETURN_MIN_DEG = 0.05   # snap to zero below this; avoids endless asymptote
+
+# Speed-sensitive steering (variable-ratio, à la Servotronic). Steering
+# authority linearly falls from 1.0 at rest to STEER_SPEED_SCALE_MIN at
+# STEER_SPEED_SCALE_REF_MPH.
+#
+# DISABLED (MIN=1.0): we don't cap max angle by speed anymore — full ±270°
+# is always available. Speed sensitivity is now a *rate* limit instead
+# (STEER_OUTWARD_RATE_*_DPS below), which feels more like a real car:
+# at speed it just takes longer to reach a given angle, but full lock
+# remains reachable if the operator keeps holding.
+STEER_SPEED_SCALE_MIN = 1.0
+STEER_SPEED_SCALE_REF_MPH = 20.0
+
+# Speed-sensitive rate limit (deg/s) on the absolute-mode steering target.
+# Applied only on *outward* motion (target moving further from center than
+# current angle). At low speed there's effectively no limit (operator has
+# full direct authority); at high speed the wheel slews more deliberately,
+# the way a real car's caster + power-steering feel works against the
+# driver. Inward motion (returning to center) is governed separately by
+# STEER_INWARD_RATE_DPS — that one stays fast at all speeds so the
+# operator can snap straight in an emergency.
+STEER_OUTWARD_RATE_LOW_DPS = 2000.0   # ~7.4 full-lock turns/s at 0 mph (effectively unbounded)
+STEER_OUTWARD_RATE_HIGH_DPS = 220.0   # full ±270° takes ~2.5 s at top speed
+STEER_INWARD_RATE_DPS = 2000.0        # release-the-stick snap-back, all speeds
+
 # Motor current headroom: scale current_soft_max toward current_hard_max with
 # demand ∈ [0,1] from |stick|, |d(lx)/dt|, and |d(ω_cmd)/dt| so fast reversals
 # keep torque for acceleration instead of hitting an overly low soft limit.
@@ -166,6 +203,35 @@ CONTROL_HZ = 50.0
 
 MODES = ("full", "steering", "pedals")
 STICK_STEERING = ("absolute", "integrated")
+
+# --- Autosteer (Autoware → steering) ---------------------------------------
+#
+# ``--autosteer`` takes the steering target from scripts/autoware_infer.py
+# (a sidecar process that runs the Autoware AutoSteer model on the front
+# narrow camera) instead of the PS5 left stick. R2/L2 still drive pedals.
+#
+# Human override: whenever ``|lx| > STEER_STICK_DEADZONE`` the operator has
+# the wheel — Autoware's value is ignored, integrated/absolute behaves as in
+# normal PS5 drive. When the stick is released we wait AUTOSTEER_HANDBACK_S
+# before handing control back to Autoware so a bounce-back through center
+# doesn't flip authority mid-correction.
+AUTOSTEER_STATE_FILE = Path("/tmp/autoware_state.json")
+AUTOSTEER_FRESH_S = 0.30          # must match autoware_infer AUTOWARE_STATE_FRESH_S
+AUTOSTEER_HANDBACK_S = 0.40        # grace period after human releases the stick
+
+# Autoware AutoSteer outputs a "steering wheel angle" in -30..+30° calibrated
+# for a passenger car with a ~15:1 steering ratio. The cart's column has
+# ~±270° lock-to-lock. With gain 3.0 the model's typical ±10° lane-following
+# predictions map to ±30° at the wheel and a worst-case ±30° prediction
+# saturates at ±90° — plenty of authority for real curves without throwing
+# the cart sideways on bad frames. Bump higher once the real-world driving
+# data shows the model under-committing.
+AUTOSTEER_GAIN = 3.0
+# Flip if the cart turns the wrong way under Autoware. Standard convention
+# (model and cart) is positive=right turn; a flipped camera mount, mirrored
+# training data, or a swapped motor wiring direction breaks that. Setting
+# to -1.0 inverts the autoware command before the cart sees it.
+AUTOSTEER_SIGN = 1.0
 
 # --- UI colors --------------------------------------------------------------
 
@@ -193,6 +259,30 @@ def apply_deadzone(value: float, deadzone: float) -> float:
 
 def clamp(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
+
+
+def steering_speed_scale(mph: float) -> float:
+    """Linear falloff: 1.0 at 0 mph → STEER_SPEED_SCALE_MIN at ref mph."""
+    t = clamp(mph / STEER_SPEED_SCALE_REF_MPH, 0.0, 1.0)
+    return 1.0 - (1.0 - STEER_SPEED_SCALE_MIN) * t
+
+
+def read_autosteer_state(path: Path) -> dict | None:
+    """Load the latest Autoware prediction. Returns None on any error —
+    callers must treat that as 'stale' (fall back to held target / zero gas).
+
+    This is deliberately forgiving: autoware_infer.py writes via atomic
+    replace, so partial reads shouldn't happen, but a stale file (process
+    died) or parse error must never crash the control loop.
+    """
+    try:
+        with path.open() as f:
+            data = json.load(f)
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    return data
 
 
 def read_trigger(js, axis: int, scale: float) -> float:
@@ -638,6 +728,16 @@ class SteeringLink:
         )
         self._controller_cfg.control_mode = ControlMode.POSITION_CONTROL
         self._controller_cfg.input_mode = InputMode.TRAP_TRAJ
+        # ODrive's TRAP_TRAJ output is hard-clipped by controller.config.vel_limit
+        # (separate from trap_traj.vel_limit). If NVM has a low value left
+        # over from calibration, the rack just stops slewing at some
+        # column angle even though the trap planner wants to go further.
+        # Force both ceilings to the same value so the trap profile is
+        # the binding constraint.
+        try:
+            self._controller_cfg.vel_limit = PS5_TRAP_VEL_MAX
+        except Exception as e:
+            print(f"[steering] couldn't set controller.vel_limit: {e!r}")
         self._trap_traj_cfg.vel_limit = PS5_TRAP_VEL_MAX
         self._trap_traj_cfg.accel_limit = PS5_TRAP_ACCEL_MAX
         self._trap_traj_cfg.decel_limit = PS5_TRAP_DECEL_MAX
@@ -682,6 +782,38 @@ class SteeringLink:
         if self.dry_run or self.axis is None:
             return 0.0
         return motor_turns_to_steering_deg(self.axis.pos_estimate - self.start_pos)
+
+    def diagnostics(self) -> dict:
+        """Pull a snapshot of the ODrive's live state for the debug trace.
+        Anything that fails reads as None — the goal is best-effort
+        observability, never to crash the control loop."""
+        if self.dry_run or self.axis is None:
+            return {}
+        out: dict = {}
+        try:
+            out["vel"] = float(self.axis.vel_estimate)
+        except Exception:
+            out["vel"] = None
+        try:
+            out["iq"] = float(self.axis.motor.foc.Iq_measured)
+        except Exception:
+            try:
+                out["iq"] = float(self.axis.motor.current_control.Iq_measured)
+            except Exception:
+                out["iq"] = None
+        try:
+            out["i_lim"] = float(self.axis.motor.config.current_soft_max)
+        except Exception:
+            out["i_lim"] = None
+        try:
+            out["active_errors"] = int(self.axis.active_errors)
+        except Exception:
+            out["active_errors"] = None
+        try:
+            out["disarm_reason"] = int(self.axis.disarm_reason)
+        except Exception:
+            out["disarm_reason"] = None
+        return out
 
     def _apply_dynamic_current(self, demand: float) -> None:
         """Raise current_soft_max toward hard_max when demand is high (0..1)."""
@@ -940,8 +1072,11 @@ def parse_args() -> argparse.Namespace:
         help="Don't open the ODrive or serial port — just read inputs and draw the UI.",
     )
     parser.add_argument(
-        "--stick-steering", choices=STICK_STEERING, default="integrated",
-        help="integrated = trap-traj target slew (hold at release); absolute = stick maps to angle.",
+        "--stick-steering", choices=STICK_STEERING, default="absolute",
+        help="absolute (default) = stick position maps directly to wheel "
+             "angle; release the stick → wheel returns to 0 like a sim. "
+             "integrated = trap-traj target slew (hold at release); useful "
+             "when you want to set a precise angle and let go.",
     )
     parser.add_argument(
         "--headless", action="store_true",
@@ -953,6 +1088,17 @@ def parse_args() -> argparse.Namespace:
         help="If set, writes a JSON snapshot of controller state "
              "(gas/brake/mph/steer/...) to this path every loop iteration. "
              "The web UI polls it for the live speed readout.",
+    )
+    parser.add_argument(
+        "--autosteer", action="store_true",
+        help="Take steering target from scripts/autoware_infer.py's "
+             f"{AUTOSTEER_STATE_FILE} instead of the PS5 stick. Stick "
+             "past the deadzone still overrides Autoware. R2/L2 always "
+             "drive the pedals. Stale Autoware → zero gas cap.",
+    )
+    parser.add_argument(
+        "--autosteer-state-file", default=str(AUTOSTEER_STATE_FILE),
+        help="Path to the JSON file written by autoware_infer.py.",
     )
     return parser.parse_args()
 
@@ -1044,8 +1190,24 @@ def main() -> int:
             steer_target_deg = steering.column_deg_estimate()
 
         prev_lx = 0.0
+        # Last absolute-mode commanded steering angle, carried across the
+        # loop so the speed-sensitive rate limit can clamp how fast the
+        # target shifts frame-to-frame.
+        prev_steer_deg = 0.0
         last_mono = time.monotonic()
         running = True
+
+        autosteer_state_path = Path(args.autosteer_state_file)
+        # Monotonic timestamp of the last frame where the human was pushing
+        # the stick past the deadzone. Used to suppress Autoware handback for
+        # AUTOSTEER_HANDBACK_S seconds after release.
+        last_human_steer_t = 0.0
+        autosteer_status = "idle"  # "autoware" | "human" | "stale" | "idle"
+        # Throttled debug print of the autosteer pipeline so /tmp/ps5_drive.log
+        # records what the model asked for vs. what we actually commanded.
+        # Hz tuned to be readable in `tail -f` without flooding.
+        last_autosteer_log_t = 0.0
+        AUTOSTEER_LOG_HZ = 4.0
 
         # Arm the ODrive watchdog *now*, immediately before the feed loop
         # starts — all the heavyweight pygame/font setup above is already
@@ -1119,13 +1281,99 @@ def main() -> int:
             raw_dlx = (lx - prev_lx) / dt_s if dt_s > 0 else 0.0
             dlx_dt = clamp(raw_dlx, -28.0, 28.0)
 
-            if args.stick_steering == "integrated":
-                steer_target_deg += lx * STEER_INTEGRATE_RATE_DPS * dt_s
-                steer_target_deg = clamp(
-                    steer_target_deg,
-                    -PS5_STEERING_MAX_DEG,
-                    PS5_STEERING_MAX_DEG,
+            # Speed-sensitive scale uses the same trigger-derived mph as the
+            # UI readout (gas - brake, clamped 0..20). No actual wheel sensor,
+            # so this tracks commanded speed — fine for steering feel since
+            # it lightens back up the moment the operator hits the brake.
+            speed_mph = max(0.0, min(20.0, (r2 - l2) * 20.0))
+            steer_scale = steering_speed_scale(speed_mph)
+
+            # --- Autosteer read + override arbitration -----------------
+            # ``human_override`` is the single source of truth for who's
+            # driving the wheel this frame. In non-autosteer mode it's
+            # meaningless (human always drives); we still track it so the
+            # state file is consistent.
+            human_override = abs(lx) > STEER_STICK_DEADZONE
+            if human_override:
+                last_human_steer_t = now
+            auto_steer_deg: float | None = None
+            auto_fresh = False
+            if args.autosteer:
+                auto_state = read_autosteer_state(autosteer_state_path)
+                if auto_state is not None:
+                    age = time.time() - float(auto_state.get("ts", 0.0))
+                    auto_fresh = age < AUTOSTEER_FRESH_S and bool(
+                        auto_state.get("inference", False)
+                    )
+                    if auto_fresh:
+                        auto_steer_deg = float(auto_state.get("steer_deg", 0.0))
+                # Autoware is authoritative only if fresh AND the human hasn't
+                # touched the stick in the last AUTOSTEER_HANDBACK_S.
+                autoware_driving = (
+                    auto_fresh
+                    and not human_override
+                    and (now - last_human_steer_t) > AUTOSTEER_HANDBACK_S
                 )
+                if autoware_driving:
+                    autosteer_status = "autoware"
+                elif human_override:
+                    autosteer_status = "human"
+                elif auto_steer_deg is None:
+                    autosteer_status = "stale"
+                else:
+                    # fresh autoware but inside the handback grace window —
+                    # the human just released the stick. Treat as "human"
+                    # so we hold the target until the window expires, which
+                    # keeps the trap_traj planner from jerking.
+                    autosteer_status = "human"
+            else:
+                autoware_driving = False
+                autosteer_status = "idle"
+
+            # Autoware command scaled to cart authority + sign-corrected.
+            # Reused by both integrated and absolute branches below; computed
+            # once so the diagnostics field matches what we actually send.
+            auto_cmd_deg = (
+                auto_steer_deg * AUTOSTEER_GAIN * AUTOSTEER_SIGN
+                if auto_steer_deg is not None
+                else None
+            )
+
+            if args.stick_steering == "integrated":
+                if autoware_driving and auto_cmd_deg is not None:
+                    # Autoware gives us the target directly; let trap_traj
+                    # slew the wheel at its configured accel/vel caps. The
+                    # PS5 speed scale still applies so Autoware's authority
+                    # also shrinks at higher commanded speed.
+                    steer_target_deg = clamp(
+                        auto_cmd_deg * steer_scale,
+                        -PS5_STEERING_MAX_DEG,
+                        PS5_STEERING_MAX_DEG,
+                    )
+                elif human_override:
+                    steer_target_deg += lx * STEER_INTEGRATE_RATE_DPS * steer_scale * dt_s
+                    steer_target_deg = clamp(
+                        steer_target_deg,
+                        -PS5_STEERING_MAX_DEG,
+                        PS5_STEERING_MAX_DEG,
+                    )
+                else:
+                    # Self-center (sim-style caster return). Active when:
+                    #   • normal PS5 mode + stick in deadzone, or
+                    #   • --autosteer + neither human nor Autoware driving
+                    #     (e.g. Autoware stale, but the cart isn't moving
+                    #     in that case anyway because gas is gated to 0).
+                    # Tau interpolates from REST to FAST as commanded speed
+                    # grows — a parked cart returns lazily, a moving one
+                    # snaps back, mimicking caster effect.
+                    speed_t = clamp(speed_mph / STEER_RETURN_REF_MPH, 0.0, 1.0)
+                    tau = (
+                        STEER_RETURN_TAU_REST_S * (1.0 - speed_t)
+                        + STEER_RETURN_TAU_FAST_S * speed_t
+                    )
+                    steer_target_deg *= math.exp(-dt_s / tau)
+                    if abs(steer_target_deg) < STEER_RETURN_MIN_DEG:
+                        steer_target_deg = 0.0
                 if (
                     control_steering
                     and steering is not None
@@ -1136,11 +1384,112 @@ def main() -> int:
                 else:
                     steer_deg = steer_target_deg
             else:
-                steer_deg = lx * PS5_STEERING_MAX_DEG
+                if autoware_driving and auto_cmd_deg is not None:
+                    target_deg = clamp(
+                        auto_cmd_deg * steer_scale,
+                        -PS5_STEERING_MAX_DEG,
+                        PS5_STEERING_MAX_DEG,
+                    )
+                else:
+                    target_deg = lx * PS5_STEERING_MAX_DEG * steer_scale
+
+                # Speed-sensitive rate limit. The cap on how far the
+                # commanded angle can move per frame depends on:
+                #   • whether we're moving outward (|target| > |prev|) —
+                #     the rate falls linearly with speed, so a fast
+                #     turn-in at speed feels deliberate, not twitchy
+                #   • or inward (|target| <= |prev|) — uses the inward
+                #     rate, which is fast at any speed so a panicked
+                #     stick release straightens the wheel immediately
+                outward = abs(target_deg) > abs(prev_steer_deg)
+                if outward:
+                    speed_t = clamp(speed_mph / STEER_SPEED_SCALE_REF_MPH, 0.0, 1.0)
+                    rate_dps = (
+                        STEER_OUTWARD_RATE_LOW_DPS
+                        - (STEER_OUTWARD_RATE_LOW_DPS - STEER_OUTWARD_RATE_HIGH_DPS) * speed_t
+                    )
+                else:
+                    rate_dps = STEER_INWARD_RATE_DPS
+                max_step = rate_dps * dt_s
+                delta = clamp(target_deg - prev_steer_deg, -max_step, max_step)
+                steer_deg = prev_steer_deg + delta
+                prev_steer_deg = steer_deg
+
+            # Encoder readback so we can see whether the column actually
+            # reaches the commanded angle. Captured in both modes; in
+            # integrated mode steer_deg already gets overwritten with this
+            # below, but in absolute mode steer_deg stays as the command.
+            if (
+                control_steering
+                and steering is not None
+                and not steering.dry_run
+            ):
+                with hw_lock:
+                    column_deg_actual = steering.column_deg_estimate()
+            else:
+                column_deg_actual = steer_deg
+
+            # Autosteer debug trace. Prints model raw → gained command →
+            # final cart command at AUTOSTEER_LOG_HZ so we can see at a
+            # glance whether the model is predicting tiny angles, whether
+            # the gain is doing its job, and whether arbitration is
+            # silently dropping back to human/idle.
+            if (now - last_autosteer_log_t) >= 1.0 / AUTOSTEER_LOG_HZ:
+                last_autosteer_log_t = now
+                if args.autosteer:
+                    raw_str = f"{auto_steer_deg:+6.2f}" if auto_steer_deg is not None else "  None"
+                    cmd_str = f"{auto_cmd_deg:+7.2f}" if auto_cmd_deg is not None else "   None"
+                    print(
+                        f"[autosteer] status={autosteer_status:<8} "
+                        f"raw={raw_str}° gain×sign={AUTOSTEER_GAIN}×{AUTOSTEER_SIGN:+.0f} "
+                        f"cmd={cmd_str}° scale={steer_scale:.2f} "
+                        f"final_steer={steer_deg:+7.2f}° "
+                        f"encoder={column_deg_actual:+7.2f}° fresh={auto_fresh} "
+                        f"human_override={human_override} mph={speed_mph:.1f}",
+                        flush=True,
+                    )
+                else:
+                    # Human-only trace — same encoder vs cmd comparison
+                    # so we can see if the wheel is failing to track in
+                    # plain PS5 mode too (i.e. the issue isn't autosteer-
+                    # specific). Also pulls live ODrive diagnostics so
+                    # we can spot vel_limit clipping, current saturation,
+                    # or an unreported error past the soft-cap boundary.
+                    diag = (
+                        steering.diagnostics()
+                        if (steering is not None and not steering.dry_run)
+                        else {}
+                    )
+                    vel = diag.get("vel")
+                    iq = diag.get("iq")
+                    ilim = diag.get("i_lim")
+                    err = diag.get("active_errors")
+                    diag_str = (
+                        f" vel={vel:+.2f}t/s" if vel is not None else " vel=??"
+                    ) + (
+                        f" Iq={iq:+.2f}A/{ilim:.1f}A" if (iq is not None and ilim is not None) else ""
+                    ) + (
+                        f" err=0x{err:x}" if (err is not None and err != 0) else ""
+                    )
+                    print(
+                        f"[steer] lx={lx:+.3f} cmd={steer_deg:+7.2f}° "
+                        f"encoder={column_deg_actual:+7.2f}° "
+                        f"scale={steer_scale:.2f} mph={speed_mph:.1f}"
+                        + diag_str,
+                        flush=True,
+                    )
 
             prev_lx = lx
 
-            gas = r2 * gas_cap
+            # Gas is gated when Autoware is supposed to drive but isn't
+            # (stale/off). The rationale: in autosteer mode the operator
+            # isn't expected to be actively steering, so moving forward with
+            # no one on the wheel is the worst-case. Human-override is still
+            # allowed full gas because the human is explicitly in the loop.
+            effective_gas_cap_now = gas_cap
+            if args.autosteer and not autoware_driving and not human_override:
+                effective_gas_cap_now = 0.0
+            gas = r2 * effective_gas_cap_now
             brake = l2 * BRAKE_POT_MAX
 
             # Drive pedals first so the heartbeat ticks before we commit
@@ -1193,6 +1542,7 @@ def main() -> int:
                         "stick_steering": args.stick_steering,
                         "lx": lx, "l2": l2, "r2": r2,
                         "steer_deg": steer_deg,
+                        "column_deg_actual": column_deg_actual,
                         "gas": gas, "brake": brake,
                         "gas_cap": gas_cap, "brake_max": BRAKE_POT_MAX,
                         "gas_frac": gas_frac, "brake_frac": brake_frac,
@@ -1203,6 +1553,15 @@ def main() -> int:
                         "hb_age_s": pedals.heartbeat_age_s if pedals is not None else 0.0,
                         "hb_faulted": pedals.faulted if pedals is not None else False,
                         "hb_fault_reason": pedals.fault_reason if pedals is not None else None,
+                        # Autosteer diagnostics — populated in both modes so
+                        # the UI can show "idle" when not in autosteer.
+                        "autosteer": args.autosteer,
+                        "autosteer_status": autosteer_status,
+                        "auto_steer_deg": auto_steer_deg,
+                        "auto_steer_cmd_deg": auto_cmd_deg,
+                        "autosteer_gain": AUTOSTEER_GAIN,
+                        "autosteer_sign": AUTOSTEER_SIGN,
+                        "human_override": human_override,
                         "ts": time.time(),
                     })
                 except Exception as e:

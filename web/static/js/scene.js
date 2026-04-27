@@ -112,15 +112,20 @@ addLine({ x: roadWidth / 2, dashed: false, color: 0x1f2328, width: 0.2 });
 addLine({ x: -roadWidth / 6, dashed: true, color: 0x9aa0a8, width: 0.16 });
 addLine({ x: roadWidth / 6, dashed: true, color: 0x9aa0a8, width: 0.16 });
 
-// ---------- Tesla-style predicted path (two glowing blue strips) ----------
-// The strips bend in response to steering — the near end stays pinned
-// just in front of the cart while the far end swings by a fraction of
-// the steer angle. Geometry is rebuilt when steer changes meaningfully;
-// 60fps rebuilds of a ~80-seg tube are cheap on any recent GPU.
+// ---------- Predicted path strips ----------
+// Two glowing strips flanking the cart's predicted path. Color tracks
+// authority — blue when the human is driving (normal PS5 mode, or human
+// override during --autosteer), gold while Autoware is in command.
+// Recoloring is cheap (we mutate the existing materials) and the angle
+// shown is always ps5_drive's commanded steer, so the path follows
+// whoever owns the wheel without any sample race.
 const PATH_SEGS = 60;
 const PATH_TUBE_SEGS = 80;
 const PATH_LENGTH = 70;
-const pathStrips = [];
+const PATH_TONES = {
+    human:    { core: 0x1f6feb, halo: 0x4b8dff, haloOpacity: 0.12 },
+    autoware: { core: 0xd4a017, halo: 0xf2c94c, haloOpacity: 0.18 },
+};
 
 function buildPathCurve(offsetX, steerDeg) {
     // Drive the bend from steering angle. At ±45° the far end sweeps
@@ -141,23 +146,20 @@ function buildPathCurve(offsetX, steerDeg) {
     return new THREE.CatmullRomCurve3(pts);
 }
 
+const pathStrips = [];
 function pathStrip(offsetX) {
     const curve = buildPathCurve(offsetX, 0);
-    // Core is opaque — transparency is what was causing the strips to
-    // drop out intermittently. Transparent meshes sort by centroid Z,
-    // so whenever a scrolling lane dash's centroid happened to be
-    // closer to the camera than the long tube's centroid, the dash
-    // drew on top and occluded sections of the strip.
-    // DoubleSide covers the other intermittent failure (Frenet frame
-    // flips on curved tubes rendering the inside face toward camera).
+    // Core is opaque — transparency was causing the strips to drop out
+    // when a scrolling lane dash's centroid was closer to the camera
+    // than the long tube's centroid. DoubleSide covers the Frenet-frame
+    // flip glitch on curved tubes.
+    const tone = PATH_TONES.human;
     const coreMat = new THREE.MeshBasicMaterial({
-        color: 0x1f6feb,
+        color: tone.core,
         side: THREE.DoubleSide,
     });
-    // Halo stays transparent; renderOrder pins it above everything so
-    // the transparent-sort glitch can't bite it either.
     const haloMat = new THREE.MeshBasicMaterial({
-        color: 0x4b8dff, transparent: true, opacity: 0.12,
+        color: tone.halo, transparent: true, opacity: tone.haloOpacity,
         side: THREE.DoubleSide,
         depthWrite: false,
     });
@@ -186,8 +188,6 @@ let displaySteerDeg = 0;
 function updatePaths(targetSteerDeg, dt) {
     const alpha = 1 - Math.exp(-dt / STEER_SMOOTH_TAU);
     displaySteerDeg += (targetSteerDeg - displaySteerDeg) * alpha;
-    // Skip rebuilds once we've essentially converged — avoids pointless
-    // GPU churn when the stick is centered and the filter has settled.
     if (Math.abs(displaySteerDeg - lastSteerDeg) < 0.08) return;
     lastSteerDeg = displaySteerDeg;
     for (const strip of pathStrips) {
@@ -200,6 +200,22 @@ function updatePaths(targetSteerDeg, dt) {
         strip.halo.geometry = nextHalo;
     }
 }
+
+// Recolor the path strips between blue (human-driven) and gold (Autoware-
+// driven). pollState in index.html calls this every state update; we
+// short-circuit no-op recolors so material.needsUpdate isn't flagged for
+// nothing every frame.
+let currentTone = "human";
+window.__setPathTone = function (tone) {
+    if (!PATH_TONES[tone] || tone === currentTone) return;
+    currentTone = tone;
+    const t = PATH_TONES[tone];
+    for (const strip of pathStrips) {
+        strip.core.material.color.setHex(t.core);
+        strip.halo.material.color.setHex(t.halo);
+        strip.halo.material.opacity = t.haloOpacity;
+    }
+};
 
 // ============ GOLF CART ============
 const cart = new THREE.Group();
