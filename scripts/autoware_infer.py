@@ -35,6 +35,7 @@ Usage:
     /usr/bin/python3 scripts/autoware_infer.py --no-infer       # cams only
     /usr/bin/python3 scripts/autoware_infer.py --no-viz         # cams + steer only
     /usr/bin/python3 scripts/autoware_infer.py --jpeg-hz 20
+    /usr/bin/python3 scripts/autoware_infer.py --video clip.mp4 # replay a clip
 """
 from __future__ import annotations
 
@@ -68,15 +69,23 @@ STATE_FILE_DEFAULT = Path("/tmp/autoware_state.json")
 SLUGS = ("front_wide", "front_narrow", "left", "right")
 INFERENCE_SLUG = "front_narrow"
 # Cameras with non-standard install orientation. cv2.flip codes:
-#   0  = vertical flip, 1 = horizontal, -1 = both (180° rotation).
+#   0  = flip across the x-axis (vertical),
+#   1  = flip across the y-axis (horizontal),
+#  -1  = both (180° rotation).
 CAMERA_ORIENTATION_FIX = {
-    "front_wide": -1,   # mounted upside down on the cart
+    "front_wide": 0,    # flip across x-axis — camera mount inverts vertically
 }
 # The 4 model-output streams that ride alongside the camera streams in the
 # UI. These slugs land in /tmp/cart_frames/ exactly like the cameras and
 # Flask serves them through the same /cam/<slug>.* endpoints.
 VIZ_SLUGS = ("lanes", "depth", "objects", "seg")
-ALL_STREAM_SLUGS = SLUGS + VIZ_SLUGS
+# Auxiliary streams not shown as UI tiles but published so the 3D scene
+# (web/static/js/scene.js) can texture-load them. ``lanes_solo`` is the
+# raw EgoLanes overlay on a black background — the 3D scene additively
+# blends it onto the road in front of the cart so the predicted lanes
+# appear as a glow under the simulated golf cart.
+AUX_SLUGS = ("lanes_solo",)
+ALL_STREAM_SLUGS = SLUGS + VIZ_SLUGS + AUX_SLUGS
 
 CAM_W, CAM_H = 640, 480     # per-camera capture; four 1080p streams saturate USB2
 INF_SIZE = (640, 320)       # SceneSeg / Scene3D / EgoLanes / AutoSteer input (w, h)
@@ -87,6 +96,16 @@ EGOLANES_THRESH = 0.04
 AUTOSPEED_CONF = 0.40
 AUTOSPEED_NMS_IOU = 0.45
 AUTOWARE_STATE_FRESH_S = 0.3
+
+# AutoSteer / EgoLanes were trained on a forward-facing narrow view and
+# work best around a ~30° horizontal FOV. The narrow USB camera and the
+# replay videos are both wider than that out of the box, so we center-
+# crop the front_narrow stream by ``tan(target/2) / tan(source/2)`` and
+# resize the crop back up to ``CAM_W × CAM_H`` so downstream code (model
+# preprocess, JPEG writers, UI tile) sees a frame that looks like it
+# came from a narrower lens. ``--narrow-fov-deg`` opts in; otherwise the
+# raw source frame passes through unchanged.
+NARROW_SOURCE_FOV_DEG_DEFAULT = 60.0
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -131,6 +150,22 @@ def open_camera(index: int) -> cv2.VideoCapture | None:
     return cap
 
 
+def center_crop_zoom(frame: np.ndarray, ratio: float) -> np.ndarray:
+    """Center-crop ``frame`` by ``ratio`` (0,1] then resize back to its
+    original WxH so the apparent FOV shrinks but the consumer-side
+    resolution is unchanged. ``ratio >= 1`` is a no-op (no crop).
+    """
+    if ratio >= 1.0 or ratio <= 0.0:
+        return frame
+    h, w = frame.shape[:2]
+    nh = max(2, int(round(h * ratio)))
+    nw = max(2, int(round(w * ratio)))
+    y0 = (h - nh) // 2
+    x0 = (w - nw) // 2
+    cropped = frame[y0:y0 + nh, x0:x0 + nw]
+    return cv2.resize(cropped, (w, h), interpolation=cv2.INTER_LINEAR)
+
+
 class CameraReader(threading.Thread):
     """Background grabber — always keeps the latest frame.
 
@@ -141,13 +176,22 @@ class CameraReader(threading.Thread):
 
     Applies any per-camera orientation fix at grab time so downstream code
     (inference + JPEG writers) sees frames in their "intended" pose.
+
+    ``crop_ratio`` (default 1.0 = no crop) shrinks the apparent FOV by
+    center-cropping then resizing back to the original WxH. Used to
+    narrow the front_narrow stream to the ~30° FOV AutoSteer/EgoLanes
+    were trained on; the orientation flip happens first so the crop is
+    still centered on the cart's forward axis when the camera is
+    installed upside-down.
     """
 
-    def __init__(self, cap: cv2.VideoCapture, slug: str):
+    def __init__(self, cap: cv2.VideoCapture, slug: str,
+                 crop_ratio: float = 1.0):
         super().__init__(daemon=True, name=f"cam-{slug}")
         self.cap = cap
         self.slug = slug
         self.flip_code = CAMERA_ORIENTATION_FIX.get(slug)
+        self.crop_ratio = crop_ratio
         self.lock = threading.Lock()
         self.frame: np.ndarray | None = None
         self.frame_count = 0
@@ -160,6 +204,8 @@ class CameraReader(threading.Thread):
             if ok and frame is not None:
                 if self.flip_code is not None:
                     frame = cv2.flip(frame, self.flip_code)
+                if self.crop_ratio < 1.0:
+                    frame = center_crop_zoom(frame, self.crop_ratio)
                 with self.lock:
                     self.frame = frame
                     self.frame_count += 1
@@ -174,6 +220,143 @@ class CameraReader(threading.Thread):
     def stop(self) -> None:
         self._stop.set()
         self.cap.release()
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Video-file source (replay mode)
+# ═══════════════════════════════════════════════════════════════════════════
+
+class VideoFileSource(threading.Thread):
+    """Reads a video file at its native FPS as a stand-in for a USB camera.
+
+    Same single-slot last-write-wins contract as ``CameraReader`` so the
+    rest of the pipeline (inference, JPEG publishing, state writing) is
+    completely unaware of where frames came from. Frames are letterboxed
+    into ``CAM_W × CAM_H`` so JPEG sizes and UI tile aspect match the
+    live-camera path byte-for-byte.
+
+    ``loop=True`` (default) seeks back to frame 0 at EOF so a short clip
+    keeps the UI animated indefinitely. With ``loop=False`` the source
+    holds the last frame and stops advancing once the clip ends.
+    """
+
+    def __init__(self, path: Path, loop: bool = True):
+        super().__init__(daemon=True, name=f"video-{path.name}")
+        self.path = path
+        self.loop = loop
+        self.cap = cv2.VideoCapture(str(path))
+        if not self.cap.isOpened():
+            raise RuntimeError(f"Failed to open video file: {path}")
+        self.native_fps = float(self.cap.get(cv2.CAP_PROP_FPS) or 30.0)
+        self.total_frames = int(self.cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        self.src_w = int(self.cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+        self.src_h = int(self.cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+        self.lock = threading.Lock()
+        self.frame: np.ndarray | None = None
+        self.frame_count = 0
+        self.video_pos = 0          # 0-based frame index of latest frame
+        self.loops = 0
+        self.last_ok_s = 0.0
+        self._stop = threading.Event()
+
+    def _letterbox(self, frame: np.ndarray) -> np.ndarray:
+        """Resize+pad ``frame`` to ``(CAM_W, CAM_H)`` preserving aspect.
+
+        Black bars top/bottom or left/right as needed. Keeping the aspect
+        ratio matters because the inference pipeline assumes a forward-
+        facing view and a non-uniform squish would slightly skew lane
+        geometry.
+        """
+        sh, sw = frame.shape[:2]
+        if sw == CAM_W and sh == CAM_H:
+            return frame
+        scale = min(CAM_W / sw, CAM_H / sh)
+        nw, nh = max(1, int(sw * scale)), max(1, int(sh * scale))
+        resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_AREA)
+        out = np.zeros((CAM_H, CAM_W, 3), dtype=np.uint8)
+        py, px = (CAM_H - nh) // 2, (CAM_W - nw) // 2
+        out[py:py + nh, px:px + nw] = resized
+        return out
+
+    def run(self) -> None:
+        period = 1.0 / max(self.native_fps, 1.0)
+        next_t = time.monotonic()
+        while not self._stop.is_set():
+            ok, frame = self.cap.read()
+            if not ok or frame is None:
+                if self.loop:
+                    self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                    self.loops += 1
+                    print(f"[video] looped ({self.loops} restarts) "
+                          f"{self.path.name}")
+                    next_t = time.monotonic()
+                    continue
+                # Non-loop EOF: hold the last frame, stop ticking the clock.
+                print(f"[video] reached end of {self.path.name} (no loop)")
+                break
+            framed = self._letterbox(frame)
+            with self.lock:
+                self.frame = framed
+                self.frame_count += 1
+                self.video_pos = int(
+                    self.cap.get(cv2.CAP_PROP_POS_FRAMES) or 0
+                )
+                self.last_ok_s = time.monotonic()
+            # Pace at native FPS. If we're falling behind (inference slow),
+            # don't accumulate "owed" sleeps — just resync from now.
+            next_t += period
+            sleep_s = next_t - time.monotonic()
+            if sleep_s > 0:
+                time.sleep(sleep_s)
+            else:
+                next_t = time.monotonic()
+
+    def latest(self) -> np.ndarray | None:
+        with self.lock:
+            return None if self.frame is None else self.frame
+
+    def stop(self) -> None:
+        self._stop.set()
+        self.cap.release()
+
+
+class VideoSlotReader:
+    """Slug-attached view onto a shared ``VideoFileSource``.
+
+    Duck-types ``CameraReader`` so the main loop's ``readers`` list works
+    unchanged: inference picks ``slug_map[INFERENCE_SLUG]`` and the JPEG
+    publisher iterates ``readers``. All four UI tiles end up showing the
+    same video frame — ``front_narrow`` is the one fed into the perception
+    stack; the others are cosmetic copies so the grid isn't half-empty.
+
+    ``crop_ratio`` is applied per-slot in ``latest()`` (not on the
+    shared source) so the narrow-FOV crop only affects ``front_narrow``
+    and the other three slugs keep showing the full frame.
+    """
+
+    def __init__(self, source: VideoFileSource, slug: str,
+                 crop_ratio: float = 1.0):
+        self.source = source
+        self.slug = slug
+        self.flip_code = None
+        self.crop_ratio = crop_ratio
+        self.frame_count = 0  # unused by the loop, but kept for parity
+        self.last_ok_s = 0.0
+
+    def latest(self) -> np.ndarray | None:
+        frame = self.source.latest()
+        if frame is None or self.crop_ratio >= 1.0:
+            return frame
+        return center_crop_zoom(frame, self.crop_ratio)
+
+    def start(self) -> None:
+        # The underlying source thread is started once at the top level;
+        # individual slot views are passive.
+        pass
+
+    def stop(self) -> None:
+        # Source is stopped once at the top level.
+        pass
 
 
 # ═══════════════════════════════════════════════════════════════════════════
@@ -343,6 +526,21 @@ class InferencePipeline:
         return cv2.resize(bgr, (CAM_W, CAM_H))
 
     def _viz_lanes(self, el_pred, frame_bgr):
+        """Returns (blended, solo).
+
+        ``blended`` — the camera frame with lane colors layered on top
+        (the existing UI ``lanes`` tile).
+        ``solo`` — the same lane mask but on a black background. The 3D
+        scene additively blends this onto the road plane in front of the
+        cart so black pixels contribute nothing and the predicted lanes
+        show up as a glow.
+
+        The solo mask is also dilated. Raw EgoLanes lines are ~1-3 pixels
+        wide; JPEG quality 72 + 4:2:0 chroma subsampling averages those
+        bright pixels into the black neighbors and the result blends to
+        nearly invisible on the road. Widening to ~9 pixels lets the
+        colors survive compression with full saturation.
+        """
         torch = self.torch
         from torch.nn import functional as F
         h, w = frame_bgr.shape[:2]
@@ -357,7 +555,14 @@ class InferencePipeline:
             overlay[mask] = self.egolanes_colors[c]
         frame_gpu = torch.from_numpy(frame_bgr).to(self.device, non_blocking=True)
         blended = (frame_gpu.float() + overlay * 0.5).clamp(0, 255).to(torch.uint8)
-        return blended.cpu().numpy()
+        # Solo: dilate on CPU so JPEG compression doesn't eat the thin
+        # lane lines. Cheap (one ~5 ms cv2.dilate on a 640x480) and only
+        # touches the solo branch — the UI ``lanes`` tile keeps its
+        # original sharp overlay.
+        solo_np = overlay.clamp(0, 255).to(torch.uint8).cpu().numpy()
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (9, 9))
+        solo_np = cv2.dilate(solo_np, kernel, iterations=1)
+        return blended.cpu().numpy(), solo_np
 
     def _viz_objects(self, frame_bgr, dets, orig_w, orig_h):
         out = frame_bgr.copy()
@@ -457,7 +662,7 @@ class InferencePipeline:
         # Build the four UI tiles. Lanes/objects stack onto the camera
         # frame so the operator sees overlay-on-reality; depth/seg show
         # the model output directly so the structure is readable.
-        viz_lanes = self._viz_lanes(el_pred, frame_bgr)
+        viz_lanes, viz_lanes_solo = self._viz_lanes(el_pred, frame_bgr)
         viz_depth = self._viz_depth(s3d_pred)
         viz_seg = self._viz_seg(ss_pred)
         viz_objects = self._viz_objects(frame_bgr, dets,
@@ -474,6 +679,7 @@ class InferencePipeline:
             "object_count": len(dets),
             "brake_level": brake_level,
             "viz_lanes": viz_lanes,
+            "viz_lanes_solo": viz_lanes_solo,
             "viz_depth": viz_depth,
             "viz_seg": viz_seg,
             "viz_objects": viz_objects,
@@ -484,8 +690,9 @@ class InferencePipeline:
 # Atomic file writers (rename is atomic on same filesystem)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def write_jpeg_atomic(path: Path, frame: np.ndarray) -> None:
-    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, JPEG_QUALITY])
+def write_jpeg_atomic(path: Path, frame: np.ndarray,
+                       quality: int = JPEG_QUALITY) -> None:
+    ok, buf = cv2.imencode(".jpg", frame, [cv2.IMWRITE_JPEG_QUALITY, quality])
     if not ok:
         return
     tmp = path.with_suffix(".jpg.tmp")
@@ -520,6 +727,26 @@ def parse_args() -> argparse.Namespace:
                    help="Max per-stream JPEG publish rate (default 15).")
     p.add_argument("--indices", type=int, nargs="*", default=None,
                    help="Override v4l2 indices (e.g. --indices 0 1 2 3).")
+    p.add_argument("--video", default=None,
+                   help="Path to a video file to replay as the inference "
+                        "input instead of opening live USB cameras. The "
+                        "frames are letterboxed to the camera resolution and "
+                        "fanned out across all four UI tiles, so downstream "
+                        "consumers (autosteer, /state, MJPEG) behave exactly "
+                        "as if a real camera produced them.")
+    p.add_argument("--no-loop", action="store_true",
+                   help="With --video, stop at end-of-file instead of "
+                        "seeking back to frame 0.")
+    p.add_argument("--narrow-fov-deg", type=float, default=None,
+                   help="Center-crop the front_narrow stream so its "
+                        "apparent horizontal FOV is this many degrees. "
+                        "AutoSteer/EgoLanes prefer ~30°. Default: no crop.")
+    p.add_argument("--narrow-source-fov-deg", type=float,
+                   default=NARROW_SOURCE_FOV_DEG_DEFAULT,
+                   help="Source horizontal FOV (degrees) used to compute "
+                        "the crop ratio for --narrow-fov-deg. Set this to "
+                        "the actual lens FOV (live) or the recording "
+                        f"camera FOV (video). Default: {NARROW_SOURCE_FOV_DEG_DEFAULT}°.")
     return p.parse_args()
 
 
@@ -531,31 +758,89 @@ def main() -> int:
     state_path = Path(args.state_file)
     state_path.parent.mkdir(parents=True, exist_ok=True)
 
-    print("[cams] discovering v4l2 devices...")
-    indices = args.indices or discover_v4l2_indices(count=len(SLUGS))
-    print(f"[cams] indices: {indices}")
-    if not indices:
-        print("ERROR: no cameras found. Try: v4l2-ctl --list-devices")
-        return 1
+    # Compute the narrow-FOV crop ratio once so both the live-camera and
+    # video-replay branches can hand it to the front_narrow reader.
+    narrow_crop_ratio = 1.0
+    if args.narrow_fov_deg is not None:
+        import math
+        target = max(1.0, min(170.0, args.narrow_fov_deg))
+        source = max(1.0, min(170.0, args.narrow_source_fov_deg))
+        if target >= source:
+            print(f"[fov] WARN: target {target}° >= source {source}° — "
+                  "no crop applied")
+        else:
+            narrow_crop_ratio = (math.tan(math.radians(target / 2.0))
+                                  / math.tan(math.radians(source / 2.0)))
+            print(f"[fov] front_narrow center-crop {target:.1f}°/"
+                  f"{source:.1f}° → ratio {narrow_crop_ratio:.3f}")
 
-    readers: list[CameraReader] = []
-    for idx, slug in zip(indices, SLUGS):
-        cap = open_camera(idx)
-        if cap is None:
-            print(f"[cams] WARN: idx {idx} ({slug}) failed to open")
-            continue
-        r = CameraReader(cap, slug)
-        r.start()
-        readers.append(r)
-        print(f"[cams] {slug:<12} -> /dev/video{idx}"
-              + (f"  (flip={CAMERA_ORIENTATION_FIX[slug]})"
-                 if slug in CAMERA_ORIENTATION_FIX else ""))
+    video_source: VideoFileSource | None = None
+    readers: list = []  # CameraReader | VideoSlotReader, duck-typed
+    if args.video:
+        video_path = Path(args.video).expanduser()
+        if not video_path.exists():
+            print(f"ERROR: --video path does not exist: {video_path}")
+            return 1
+        print(f"[video] opening {video_path}")
+        try:
+            video_source = VideoFileSource(video_path, loop=not args.no_loop)
+        except RuntimeError as e:
+            print(f"ERROR: {e}")
+            return 1
+        video_source.start()
+        duration_s = (video_source.total_frames / video_source.native_fps
+                      if video_source.native_fps > 0 else 0.0)
+        print(f"[video] source: {video_source.src_w}x{video_source.src_h} "
+              f"@ {video_source.native_fps:.2f} fps, "
+              f"{video_source.total_frames} frames "
+              f"(~{duration_s:.1f}s){'  loop' if not args.no_loop else ''}")
+        for slug in SLUGS:
+            crop = narrow_crop_ratio if slug == INFERENCE_SLUG else 1.0
+            r = VideoSlotReader(video_source, slug, crop_ratio=crop)
+            readers.append(r)
+            extra = (f"  (narrow-fov crop {crop:.3f})"
+                     if crop < 1.0 else "")
+            print(f"[video] {slug:<12} -> {video_path.name} (replay){extra}")
+        # Wait for the first decoded frame so inference doesn't trip over
+        # an empty source on its very first iteration.
+        wait_t0 = time.monotonic()
+        while video_source.latest() is None:
+            if time.monotonic() - wait_t0 > 5.0:
+                print("ERROR: video produced no frames within 5s")
+                video_source.stop()
+                return 1
+            time.sleep(0.05)
+        print("[video] first frame decoded, ready")
+    else:
+        print("[cams] discovering v4l2 devices...")
+        indices = args.indices or discover_v4l2_indices(count=len(SLUGS))
+        print(f"[cams] indices: {indices}")
+        if not indices:
+            print("ERROR: no cameras found. Try: v4l2-ctl --list-devices")
+            return 1
 
-    if not readers:
-        print("ERROR: opened 0 cameras.")
-        return 1
+        for idx, slug in zip(indices, SLUGS):
+            cap = open_camera(idx)
+            if cap is None:
+                print(f"[cams] WARN: idx {idx} ({slug}) failed to open")
+                continue
+            crop = narrow_crop_ratio if slug == INFERENCE_SLUG else 1.0
+            r = CameraReader(cap, slug, crop_ratio=crop)
+            r.start()
+            readers.append(r)
+            extras = []
+            if slug in CAMERA_ORIENTATION_FIX:
+                extras.append(f"flip={CAMERA_ORIENTATION_FIX[slug]}")
+            if crop < 1.0:
+                extras.append(f"narrow-fov crop {crop:.3f}")
+            tail = f"  ({', '.join(extras)})" if extras else ""
+            print(f"[cams] {slug:<12} -> /dev/video{idx}{tail}")
 
-    time.sleep(0.4)
+        if not readers:
+            print("ERROR: opened 0 cameras.")
+            return 1
+
+        time.sleep(0.4)
 
     pipe: InferencePipeline | None = None
     active_slug = INFERENCE_SLUG
@@ -579,14 +864,30 @@ def main() -> int:
     last = {
         "steer_raw": 0.0, "steer_smoothed": 0.0,
         "object_count": 0, "brake_level": 0.0,
-        "viz_lanes": None, "viz_depth": None,
-        "viz_seg": None, "viz_objects": None,
+        "viz_lanes": None, "viz_lanes_solo": None,
+        "viz_depth": None, "viz_seg": None, "viz_objects": None,
     }
 
     print("[run] publishing to", frames_dir, "and", state_path)
+    last_video_log_t = 0.0
     try:
         while True:
             loop_t = time.monotonic()
+
+            # Periodic video progress log so the operator can see the clip
+            # advancing in /tmp/autoware_infer.log without scraping JPEG
+            # mtimes. ~1 Hz is enough.
+            if video_source is not None and loop_t - last_video_log_t > 1.0:
+                last_video_log_t = loop_t
+                pos = video_source.video_pos
+                total = max(video_source.total_frames, 1)
+                t_s = pos / max(video_source.native_fps, 1.0)
+                infer_fps = (1.0 / (sum(infer_times) / len(infer_times))
+                             if infer_times else 0.0)
+                print(f"[video] frame {pos}/{total} "
+                      f"(t={t_s:6.2f}s, loops={video_source.loops}) "
+                      f"steer={last['steer_smoothed']:+6.2f}° "
+                      f"infer_fps={infer_fps:5.1f}")
 
             # ── 1) Inference (when enabled). Runs as fast as the GPU
             # allows so the steering target is fresh; viz JPEGs are
@@ -617,21 +918,32 @@ def main() -> int:
                         continue
                     write_jpeg_atomic(frames_dir / f"{r.slug}.jpg", frame)
                 # Viz tiles: only when we have outputs and viz is on.
+                # ``lanes_solo`` rides along here too — same publish
+                # cadence, same atomic-rename guarantee, but it's an
+                # auxiliary stream consumed by scene.js (not a UI tile).
                 if pipe is not None and not args.no_viz:
-                    for slug, key in [
-                        ("lanes", "viz_lanes"),
-                        ("depth", "viz_depth"),
-                        ("seg", "viz_seg"),
-                        ("objects", "viz_objects"),
+                    # (slug, last-key, jpeg-quality). lanes_solo gets a
+                    # higher quality because it's the additive-blend
+                    # texture for the 3D scene; default 72 mangles the
+                    # thin colored strokes on the otherwise-black field
+                    # into near-invisibility on the road.
+                    for slug, key, qual in [
+                        ("lanes", "viz_lanes", JPEG_QUALITY),
+                        ("depth", "viz_depth", JPEG_QUALITY),
+                        ("seg", "viz_seg", JPEG_QUALITY),
+                        ("objects", "viz_objects", JPEG_QUALITY),
+                        ("lanes_solo", "viz_lanes_solo", 92),
                     ]:
                         viz = last.get(key)
                         if viz is not None:
-                            write_jpeg_atomic(frames_dir / f"{slug}.jpg", viz)
+                            write_jpeg_atomic(
+                                frames_dir / f"{slug}.jpg", viz, qual,
+                            )
                 next_jpeg_t = loop_t + jpeg_period
 
             # ── 3) Publish state.
             mean_dt = sum(infer_times) / len(infer_times) if infer_times else 0.0
-            write_state_atomic(state_path, {
+            state_payload = {
                 "steer_deg": float(last["steer_smoothed"]),
                 "steer_deg_raw": float(last["steer_raw"]),
                 "active_cam": active_slug if pipe is not None else None,
@@ -641,8 +953,20 @@ def main() -> int:
                 "object_count": int(last["object_count"]),
                 "fps": (1.0 / mean_dt) if mean_dt > 0 else 0.0,
                 "cams": [r.slug for r in readers],
+                "source": "video" if video_source is not None else "camera",
                 "ts": time.time(),
-            })
+            }
+            if video_source is not None:
+                state_payload["video"] = {
+                    "path": str(video_source.path),
+                    "name": video_source.path.name,
+                    "frame": video_source.video_pos,
+                    "total_frames": video_source.total_frames,
+                    "native_fps": round(video_source.native_fps, 2),
+                    "loops": video_source.loops,
+                    "loop": not args.no_loop,
+                }
+            write_state_atomic(state_path, state_payload)
 
             if pipe is None:
                 time.sleep(0.02)
@@ -651,6 +975,8 @@ def main() -> int:
     finally:
         for r in readers:
             r.stop()
+        if video_source is not None:
+            video_source.stop()
         print("[run] done.")
     return 0
 

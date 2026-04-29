@@ -14,10 +14,13 @@ AUTOWARE_FRESH_S = 0.5  # autoware_infer writes at ~15 Hz; >500 ms = stale
 
 # Must match scripts/autoware_infer.py::ALL_STREAM_SLUGS. A request for
 # any other slug returns 404 — never stream arbitrary paths off the
-# filesystem. Order: 4 raw cameras, then 4 model-output viz tiles.
+# filesystem. Order: 4 raw cameras, then 4 model-output viz tiles, then
+# any auxiliary streams. ``lanes_solo`` is consumed by scene.js (not as
+# a UI tile) to project the predicted lanes into the 3D cart scene.
 CAM_SLUGS = (
     "front_wide", "front_narrow", "left", "right",
     "lanes", "depth", "seg", "objects",
+    "lanes_solo",
 )
 MJPEG_FPS = 15           # per-client frame rate
 MJPEG_STALE_S = 2.0      # stop streaming if frame file hasn't updated
@@ -73,6 +76,7 @@ def state():
         "viz_streams": list(auto.get("viz_streams", [])),
         "object_count": int(auto.get("object_count", 0)),
         "steer_deg": float(auto.get("steer_deg", 0.0)) if auto else 0.0,
+        "steer_deg_raw": float(auto.get("steer_deg_raw", 0.0)) if auto else 0.0,
         "active_cam": auto.get("active_cam"),
         "fps": float(auto.get("fps", 0.0)) if auto else 0.0,
         "cams": auto.get("cams", []),

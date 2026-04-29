@@ -112,6 +112,91 @@ addLine({ x: roadWidth / 2, dashed: false, color: 0x1f2328, width: 0.2 });
 addLine({ x: -roadWidth / 6, dashed: true, color: 0x9aa0a8, width: 0.16 });
 addLine({ x: roadWidth / 6, dashed: true, color: 0x9aa0a8, width: 0.16 });
 
+// ---------- Predicted-lane projection on the road ----------
+// scripts/autoware_infer.py publishes /cam/lanes_solo.jpg — the EgoLanes
+// model output rendered on a black background. We texture-map it onto a
+// flat quad lying on the road in front of the cart and additively blend
+// it, so black contributes nothing and the predicted lane glow appears
+// painted on the 3D pavement under the simulated cart. Image V axis runs
+// from "near the camera" (V=0, bottom of frame) to "horizon" (V=1, top),
+// which matches the geometry's local +Y → world -Z (forward) mapping
+// after the -PI/2 X-rotation, so no UV flip is needed.
+const LANES_PLANE_W = 6.5;       // ~road width minus a margin
+const LANES_PLANE_LEN = 24;      // forward extent
+const LANES_PLANE_NEAR_Z = -2.5; // just in front of the cart
+const LANES_PLANE_FAR_Z = LANES_PLANE_NEAR_Z - LANES_PLANE_LEN;
+const LANES_REFRESH_MS = 100;    // 10 Hz — matches autoware JPEG cadence
+
+// Use an off-DOM <img> to drive a CanvasTexture-style update: setting
+// `texture.needsUpdate = true` after each load is the cheap path; three
+// re-uploads the bitmap to the GPU on the next render.
+const lanesImg = new Image();
+lanesImg.crossOrigin = "anonymous";
+const lanesTexture = new THREE.Texture(lanesImg);
+lanesTexture.colorSpace = THREE.SRGBColorSpace;
+lanesTexture.minFilter = THREE.LinearFilter;
+lanesTexture.magFilter = THREE.LinearFilter;
+lanesTexture.generateMipmaps = false;
+lanesImg.onload = () => {
+    lanesTexture.needsUpdate = true;
+    lanesPlane.visible = true;
+};
+lanesImg.onerror = () => {
+    // No autoware viz yet (or stream went stale) — hide the plane so we
+    // don't leave a stale prediction painted on the road.
+    lanesPlane.visible = false;
+};
+
+// Soft tint instead of additive glow. AdditiveBlending on a near-white
+// road saturates almost any lane color to flat white, killing the
+// magenta/cyan/green identity the user wants to read. NormalBlending
+// preserves hue, but JPEG texels for the black background aren't pure
+// zero (chroma subsampling leaves a few-DN noise floor), so we derive
+// alpha from the per-texel max channel via a shader hook: black → 0
+// (invisible), bright lane → near-1 (translucent tint). The smoothstep
+// also kills the JPEG noise floor without a hard threshold edge.
+const LANES_OPACITY = 0.45;
+const lanesMaterial = new THREE.MeshBasicMaterial({
+    map: lanesTexture,
+    transparent: true,
+    depthWrite: false,
+    opacity: LANES_OPACITY,
+});
+lanesMaterial.onBeforeCompile = (shader) => {
+    // Hook into the alphamap slot (empty unless USE_ALPHAMAP) so we ride
+    // after `map_fragment` has populated diffuseColor and before the
+    // final alpha test / output. Multiplying into diffuseColor.a stacks
+    // with the material's `opacity` that map_fragment already folded in.
+    shader.fragmentShader = shader.fragmentShader.replace(
+        "#include <alphamap_fragment>",
+        "diffuseColor.a *= smoothstep(0.06, 0.40, "
+        + "max(max(diffuseColor.r, diffuseColor.g), diffuseColor.b));",
+    );
+};
+const lanesPlane = new THREE.Mesh(
+    new THREE.PlaneGeometry(LANES_PLANE_W, LANES_PLANE_LEN),
+    lanesMaterial,
+);
+lanesPlane.rotation.x = -Math.PI / 2;
+// Center the plane between the near and far Z bounds, slightly above
+// the asphalt so it z-fights with neither the road nor the painted lane
+// dashes that scroll past at speed.
+lanesPlane.position.set(
+    0, 0.025,
+    (LANES_PLANE_NEAR_Z + LANES_PLANE_FAR_Z) / 2,
+);
+lanesPlane.renderOrder = 3; // above road dashes (default 0) and path strips
+lanesPlane.visible = false; // wait for first successful texture load
+scene.add(lanesPlane);
+
+// Pull a fresh texture every LANES_REFRESH_MS. Cache-buster on `t` keeps
+// the browser from serving the previous frame from disk cache.
+function refreshLanesTexture() {
+    lanesImg.src = `/cam/lanes_solo.jpg?t=${Date.now()}`;
+}
+refreshLanesTexture();
+setInterval(refreshLanesTexture, LANES_REFRESH_MS);
+
 // ---------- Predicted path strips ----------
 // Two glowing strips flanking the cart's predicted path. Color tracks
 // authority — blue when the human is driving (normal PS5 mode, or human
@@ -178,20 +263,18 @@ function pathStrip(offsetX) {
 pathStrip(-0.85);
 pathStrip(0.85);
 
-// State polls arrive at ~12 Hz but animate runs at ~60 Hz — without a
-// filter the path snaps between steering samples. A low-pass toward
-// the target angle turns each state update into a smooth sweep.
-// TAU is the time constant: ~63% of the gap is closed in TAU seconds.
-const STEER_SMOOTH_TAU = 0.11;
+// Path follows the steering target with no client-side smoothing — the
+// user wants the yellow strips to mirror the autoware prediction
+// exactly (set in index.html from aw.steer_deg_raw). The "skip if change
+// < 0.08°" guard is a cheap GPU-upload short-circuit, not a filter:
+// rebuilding TubeGeometry every frame for sub-bucket noise wastes work
+// without changing what the user sees.
 let lastSteerDeg = 0;
-let displaySteerDeg = 0;
-function updatePaths(targetSteerDeg, dt) {
-    const alpha = 1 - Math.exp(-dt / STEER_SMOOTH_TAU);
-    displaySteerDeg += (targetSteerDeg - displaySteerDeg) * alpha;
-    if (Math.abs(displaySteerDeg - lastSteerDeg) < 0.08) return;
-    lastSteerDeg = displaySteerDeg;
+function updatePaths(targetSteerDeg, _dt) {
+    if (Math.abs(targetSteerDeg - lastSteerDeg) < 0.08) return;
+    lastSteerDeg = targetSteerDeg;
     for (const strip of pathStrips) {
-        const curve = buildPathCurve(strip.offsetX, displaySteerDeg);
+        const curve = buildPathCurve(strip.offsetX, targetSteerDeg);
         const nextCore = new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, 0.07, 8, false);
         const nextHalo = new THREE.TubeGeometry(curve, PATH_TUBE_SEGS, 0.22, 8, false);
         strip.core.geometry.dispose();

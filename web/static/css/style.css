@@ -387,11 +387,28 @@ html, body {
     right: 40px;
     z-index: 10;
     display: grid;
-    grid-template-columns: repeat(4, 200px);
-    grid-template-rows: repeat(2, 120px);
-    gap: 10px;
+    grid-template-columns: repeat(4, 300px);
+    grid-template-rows: repeat(2, 180px);
+    gap: 12px;
     pointer-events: none;
+    transition: grid-template-columns 220ms ease, grid-template-rows 220ms ease;
 }
+/* Manual / non-autonomous: shrink the camera grid so the cards don't
+   dominate the screen. We keep the original 300×180 footprint only while
+   Autoware is actively driving (body lacks .compact-cams). JS in
+   index.html toggles .compact-cams on <body> off the autoware status. */
+body.compact-cams .cam-grid {
+    grid-template-columns: repeat(4, 160px);
+    grid-template-rows: repeat(2, 96px);
+    gap: 8px;
+}
+body.compact-cams .cam-tile .cam-label,
+body.compact-cams .cam-tile .cam-badge {
+    font-size: 9px;
+    padding: 2px 6px;
+    letter-spacing: 0.12em;
+}
+
 
 .cam-tile {
     position: relative;
@@ -485,10 +502,10 @@ html, body {
    + status (autoware/human/stale/idle). Sits where the route-time footer
    used to, so we don't crowd the speed cluster. */
 .autoware-hud {
-    /* Sits above the 4x2 stream grid: 40 bottom margin + 120*2 rows + 10
-       gap + 12 breathing room = 302. Keep in sync with .cam-grid. */
+    /* Sits above the 4x2 stream grid: 40 bottom margin + 180*2 rows + 12
+       gap + 12 breathing room = 424. Keep in sync with .cam-grid. */
     position: fixed;
-    bottom: 302px;
+    bottom: 424px;
     right: 40px;
     z-index: 10;
     display: flex;
@@ -500,6 +517,12 @@ html, body {
     letter-spacing: 0.14em;
     text-transform: uppercase;
     font-variant-numeric: tabular-nums;
+    transition: bottom 220ms ease;
+}
+/* Compact grid is 96*2 + 8 gap = 200 tall, plus 40 bottom margin + 12
+   breathing room = 252. Mirrors the calculation above. */
+body.compact-cams .autoware-hud {
+    bottom: 252px;
 }
 .autoware-hud .aw-status-dot {
     width: 8px;

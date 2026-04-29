@@ -12,16 +12,38 @@ FRAMES_DIR="/tmp/cart_frames"
 # dashes, wheel, pedals, green dots) with a synthetic MPH. Handy for UI
 # work when the hardware isn't plugged in.
 # --autosteer turns on the Autoware inference sidecar + ps5_drive --autosteer.
+# --video=PATH replays a clip into autoware_infer.py instead of opening live
+# USB cameras. Combine with --autosteer to demo / evaluate the predictor on
+# canned footage with the wheel commanded from the inferred steer.
 MOCK_SPEED=""
 AUTOSTEER=""
+VIDEO=""
+NO_LOOP=""
+# AutoSteer / EgoLanes were trained on a ~30° forward-narrow view. Default
+# the front_narrow center-crop to 30° so the model gets the FOV it likes;
+# pass --narrow-fov-deg 0 (or any value >= source) to opt out.
+NARROW_FOV_DEG="30"
+NARROW_SOURCE_FOV_DEG=""
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --mockspeed=*) MOCK_SPEED="${1#*=}"; shift ;;
-        --mockspeed)   MOCK_SPEED="$2"; shift 2 ;;
-        --autosteer)   AUTOSTEER=1; shift ;;
+        --mockspeed=*)             MOCK_SPEED="${1#*=}"; shift ;;
+        --mockspeed)               MOCK_SPEED="$2"; shift 2 ;;
+        --autosteer)               AUTOSTEER=1; shift ;;
+        --video=*)                 VIDEO="${1#*=}"; shift ;;
+        --video)                   VIDEO="$2"; shift 2 ;;
+        --no-loop)                 NO_LOOP=1; shift ;;
+        --narrow-fov-deg=*)        NARROW_FOV_DEG="${1#*=}"; shift ;;
+        --narrow-fov-deg)          NARROW_FOV_DEG="$2"; shift 2 ;;
+        --narrow-source-fov-deg=*) NARROW_SOURCE_FOV_DEG="${1#*=}"; shift ;;
+        --narrow-source-fov-deg)   NARROW_SOURCE_FOV_DEG="$2"; shift 2 ;;
         *) echo "start.sh: unknown arg $1" >&2; exit 2 ;;
     esac
 done
+
+if [[ -n "$VIDEO" && ! -f "$VIDEO" ]]; then
+    echo "start.sh: --video file not found: $VIDEO" >&2
+    exit 2
+fi
 
 cleanup() {
     kill "$SRV" 2>/dev/null || true
@@ -51,6 +73,20 @@ mkdir -p "$FRAMES_DIR"
 # ./start.sh --no-autoware skips even loading the models if you need the
 # UI without spinning up CUDA (development on a non-Jetson host, etc.).
 AUTOWARE_ARGS=(--frames-dir "$FRAMES_DIR" --state-file "$AUTOWARE_STATE_FILE")
+if [[ -n "$VIDEO" ]]; then
+    AUTOWARE_ARGS+=(--video "$VIDEO")
+    [[ -n "$NO_LOOP" ]] && AUTOWARE_ARGS+=(--no-loop)
+    echo "[start] VIDEO mode — replaying $VIDEO into the inference pipeline" \
+        >>/tmp/autoware_infer.log
+fi
+# A value of 0 (or empty) means "don't crop". Anything > 0 narrows the
+# front_narrow stream's apparent FOV to that many degrees.
+if [[ -n "$NARROW_FOV_DEG" && "$NARROW_FOV_DEG" != "0" ]]; then
+    AUTOWARE_ARGS+=(--narrow-fov-deg "$NARROW_FOV_DEG")
+    if [[ -n "$NARROW_SOURCE_FOV_DEG" ]]; then
+        AUTOWARE_ARGS+=(--narrow-source-fov-deg "$NARROW_SOURCE_FOV_DEG")
+    fi
+fi
 # autoware_infer.py needs torch — it runs on the system Python 3.12 that
 # has the Jetson CUDA wheel, not PRODUCTION's uv-managed 3.13.
 /usr/bin/python3 scripts/autoware_infer.py "${AUTOWARE_ARGS[@]}" \

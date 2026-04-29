@@ -7,7 +7,7 @@
     <link href="{{ url_for('static', filename='vendor/fonts/fonts.css') }}" rel="stylesheet">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/style.css') }}">
 </head>
-<body>
+<body class="compact-cams">
     <div id="scene-container"></div>
 
     <!-- Top status bar -->
@@ -290,6 +290,14 @@
             awHud.classList.add('status-' + status);
             awStatus.textContent = status.toUpperCase();
 
+            // Camera tile sizing follows drive mode: full-size only while
+            // Autoware is actively steering, compact in every other state
+            // (idle / human override / stale) so the cards don't dominate
+            // the screen during manual driving.
+            document.body.classList.toggle(
+                'compact-cams', status !== 'autoware'
+            );
+
             // Angle shown is what Autoware currently predicts; when idle we
             // show an em dash because a stale 0° could be misread as "model
             // thinks we're centered" when really the model isn't running.
@@ -340,8 +348,18 @@
                 const steerDeg = Number(s.steer_deg) || 0;
                 wheelEl.style.transform = `rotate(${steerDeg}deg)`;
                 angleEl.textContent = `${steerDeg >= 0 ? '+' : ''}${steerDeg.toFixed(0)}°`;
-                // Published for scene.js to bend the predicted path.
-                window.__steerDeg = steerDeg;
+                // Published for scene.js to bend the predicted path. When
+                // autoware is producing predictions, use the model's raw
+                // argmax (no autoware-side EMA, no ps5_drive gain/sign,
+                // no client-side smoothing) so the yellow strips track
+                // the model output exactly. Falls back to the commanded
+                // wheel angle in plain PS5 mode where autoware is off.
+                const aw0 = s.autoware || {};
+                if (aw0.running && aw0.inference) {
+                    window.__steerDeg = Number(aw0.steer_deg_raw) || 0;
+                } else {
+                    window.__steerDeg = steerDeg;
+                }
 
                 updatePedalStack(
                     Math.max(0, Math.min(1, Number(s.gas_frac) || 0)),

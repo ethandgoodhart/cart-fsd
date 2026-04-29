@@ -175,7 +175,7 @@ void stepPedal(Pedal &p) {
 }
 
 // ---- Command parsing ----------------------------------------------------
-// Accepts:  G <float>  |  B <float>  |  S  |  H
+// Accepts:  G <float>  |  B <float>  |  S  |  H  |  D
 void handleCommand(char *cmd) {
   switch (cmd[0]) {
     case 'G': {
@@ -201,6 +201,19 @@ void handleCommand(char *cmd) {
     case 'H':
       // heartbeat only — timestamp already updated on the byte-read path
       break;
+    case 'D':
+      // Graceful disarm: host is shutting down on purpose. Release both
+      // pedals AND set failsafe=true so the heartbeat watchdog does NOT
+      // re-engage the brake once the host goes quiet. Returns early to
+      // skip the post-switch failsafe-clear; otherwise we'd just go
+      // straight back into the "host is alive" state and the watchdog
+      // would slam the brake 300 ms later. Distinct from `S` (which
+      // releases pedals but keeps the cart armed for more commands).
+      gas.target   = gas.pot_min;
+      brake.target = brake.pot_min;
+      failsafe     = true;
+      Serial.println(F("INFO,disarmed by host (graceful shutdown — pedals released, watchdog parked)"));
+      return;
     default:
       Serial.print(F("ERR,unknown cmd: "));
       Serial.println(cmd);
@@ -241,11 +254,14 @@ void checkHeartbeat() {
   unsigned long age = millis() - last_host_byte_ms;
   if (!failsafe && age > HEARTBEAT_TIMEOUT_MS) {
     failsafe = true;
+    // Real failsafe: host disappeared → slam the brake, drop the gas.
+    // Releasing both (the old behavior) made the cart coast, which is
+    // the wrong answer when the operator's controller just dropped.
     gas.target   = gas.pot_min;
-    brake.target = brake.pot_min;
+    brake.target = brake.pot_max;
     Serial.print(F("ERR,heartbeat timeout after "));
     Serial.print(age);
-    Serial.println(F(" ms — FAILSAFE engaged (pedals retracting)"));
+    Serial.println(F(" ms — FAILSAFE engaged (brake=MAX, gas=0)"));
   }
 }
 

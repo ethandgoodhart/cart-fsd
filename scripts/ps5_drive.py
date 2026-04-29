@@ -114,8 +114,10 @@ else:
     AXIS_L2 = 3
     AXIS_R2 = 4
 
-# DualSense face buttons on SDL 2.28+ (macOS / Linux): Cross=0, Circle=1,
-# Square=2, Triangle=3. Matches scripts/ps5_steer.py.
+# DualSense face buttons. Indexes were observed empirically on the cart's
+# Jetson via the [ps5] button-down log (SDL/hid-playstation on this build
+# does NOT match the macOS Cross=0/Circle=1/Square=2/Triangle=3 mapping).
+BUTTON_CIRCLE = 2
 BUTTON_TRIANGLE = 3
 
 # Default deadzone (e.g. other scripts). Steering X uses ``STEER_STICK_DEADZONE`` so
@@ -493,20 +495,48 @@ class PedalLink:
                 print(f"[mega] {text}")
 
     def stop(self) -> None:
-        """Best-effort 'release both pedals NOW' on the way out.
+        """Graceful disarm: release both pedals AND park the firmware
+        watchdog so it doesn't slam the brake after we close the port.
 
-        Repeated writes because the first one sometimes gets swallowed if
-        the port is already half-gone (USB yank race). If this fails the
-        firmware's own heartbeat watchdog will do the same thing ~300 ms
-        after the last byte it saw anyway.
+        Sends ``D\\n`` (not ``S\\n``): the firmware's `D` handler sets
+        gas/brake targets to min and flips ``failsafe = true`` without
+        clearing it, so the heartbeat-timeout watchdog won't fire its
+        brake-MAX failsafe once we stop sending bytes. This is the
+        intentional-shutdown path — controller-drop uses ``panic_brake``
+        instead, which deliberately leaves failsafe armed so the
+        watchdog DOES latch brake=MAX after we exit.
+
+        Repeated writes because the first one sometimes gets swallowed
+        if the port is already half-gone (USB yank race).
         """
         if self.dry_run or self.ser is None:
-            print("[pedals] STOP")
+            print("[pedals] STOP (graceful disarm)")
             return
         for _ in range(3):
             try:
-                self.ser.write(b"S\n")
+                self.ser.write(b"D\n")
                 time.sleep(0.02)
+            except Exception:
+                break
+
+    def panic_brake(self) -> None:
+        """Force max brake + zero gas immediately. Used on controller drop.
+
+        Bypasses ``faulted`` so we still try even if a previous write
+        errored. After we exit, the firmware's 300 ms heartbeat watchdog
+        latches failsafe (brake=MAX, gas=0) on its own — this just makes
+        the brake go on as fast as USB can carry the bytes.
+        """
+        payload = f"G 0.000\nB {BRAKE_POT_MAX:.3f}\n".encode("ascii")
+        if self.dry_run or self.ser is None:
+            print(f"[pedals] PANIC BRAKE (B={BRAKE_POT_MAX:.3f})")
+            return
+        print(f"[pedals] PANIC BRAKE — B={BRAKE_POT_MAX:.3f}, G=0")
+        for _ in range(5):
+            try:
+                self.ser.write(payload)
+                self.ser.flush()
+                time.sleep(0.01)
             except Exception:
                 break
 
@@ -929,6 +959,33 @@ class SteeringLink:
             print(f"[steering] rebase_zero: controller write failed: {e!r}")
         return self.start_pos
 
+    def panic_zero(self, hold_s: float = 0.6) -> None:
+        """Drive the wheel to 0° and HOLD before idling.
+
+        Used on controller disconnect: ``stop()`` writes 0° but only
+        sleeps 0.25 s before transitioning to IDLE, which can cut off the
+        trap-traj move from larger angles. Here we slam the trap planner
+        to its configured max and feed the watchdog while we wait, so the
+        wheel actually reaches center under power.
+        """
+        if self.dry_run or self.axis is None:
+            return
+        try:
+            self.axis.controller.input_pos = self.start_pos
+            self._prev_target_motor = 0.0
+            self._prev_vel_cmd_motor = 0.0
+        except Exception as e:
+            print(f"[steering] panic_zero: input_pos write failed: {e!r}")
+            return
+        deadline = time.monotonic() + hold_s
+        while time.monotonic() < deadline:
+            if self._watchdog_enabled:
+                try:
+                    self.axis.watchdog_feed()
+                except Exception:
+                    pass
+            time.sleep(0.02)
+
     def stop(self) -> None:
         if self.dry_run or self.axis is None:
             return
@@ -942,7 +999,12 @@ class SteeringLink:
             self._watchdog_enabled = False
         try:
             self.axis.controller.input_pos = self.start_pos
-            time.sleep(0.25)
+            # Long enough for the trap-traj planner to drive the wheel
+            # from full lock back to 0 before we idle the axis. At
+            # PS5_TRAP_VEL_MAX=8 t/s + accel=15 t/s² the worst case
+            # (±270° → 0°) takes ~0.77 s; round up generously so we
+            # never idle mid-return on a graceful shutdown.
+            time.sleep(1.0)
             if self._saved_current_soft is not None:
                 _set_motor_current_soft_max(self.axis, self._saved_current_soft)
             self._controller_cfg.input_mode = self._InputMode.PASSTHROUGH
@@ -1137,6 +1199,7 @@ def main() -> int:
     pedals: PedalLink | None = None
     steering: SteeringLink | None = None
     exit_code = 0
+    panic_disconnect = False
 
     try:
         # Graceful degrade: if either hardware init fails, keep the loop
@@ -1194,6 +1257,8 @@ def main() -> int:
         # loop so the speed-sensitive rate limit can clamp how fast the
         # target shifts frame-to-frame.
         prev_steer_deg = 0.0
+        # Latched soft e-stop, toggled by the ○ Circle button.
+        circle_estop = False
         last_mono = time.monotonic()
         running = True
 
@@ -1231,21 +1296,33 @@ def main() -> int:
                 elif event.type == pygame.KEYDOWN and event.key in (pygame.K_ESCAPE, pygame.K_q):
                     running = False
                 elif event.type == pygame.JOYDEVICEREMOVED:
-                    print("[ps5] controller disconnected — stopping.")
+                    print("[ps5] controller disconnected — panic-braking.")
+                    panic_disconnect = True
                     running = False
-                elif event.type == pygame.JOYBUTTONDOWN and event.button == BUTTON_TRIANGLE:
-                    # Triangle → re-zero the steering reference to whatever
-                    # the wheel looks like right now. Integrated mode's
-                    # target angle is also reset so the trap planner doesn't
-                    # yank the wheel back to the old zero.
-                    if control_steering and steering is not None:
-                        with hw_lock:
-                            new_zero = steering.rebase_zero()
-                        steer_target_deg = 0.0
-                        print(
-                            f"[steering] △ Triangle: zero rebased to "
-                            f"{new_zero:.4f} turns (wheel is now 0°)"
-                        )
+                elif event.type == pygame.JOYBUTTONDOWN:
+                    # Log every press so a wrong button mapping is obvious
+                    # in /tmp/ps5_drive.log (DualSense indices vary across
+                    # SDL versions / Linux input drivers).
+                    print(f"[ps5] button down: index={event.button}")
+                    if event.button == BUTTON_CIRCLE:
+                        # ○ Circle = tap-to-toggle soft e-stop (brake=MAX,
+                        # gas=0). Tap again to clear.
+                        circle_estop = not circle_estop
+                        state = "ENGAGED" if circle_estop else "released"
+                        print(f"[ps5] ○ Circle e-stop {state}")
+                    elif event.button == BUTTON_TRIANGLE:
+                        # Triangle → re-zero the steering reference to whatever
+                        # the wheel looks like right now. Integrated mode's
+                        # target angle is also reset so the trap planner doesn't
+                        # yank the wheel back to the old zero.
+                        if control_steering and steering is not None:
+                            with hw_lock:
+                                new_zero = steering.rebase_zero()
+                            steer_target_deg = 0.0
+                            print(
+                                f"[steering] △ Triangle: zero rebased to "
+                                f"{new_zero:.4f} turns (wheel is now 0°)"
+                            )
 
             # Drain any telemetry/events from the Mega (EVT,ESTOP,...).
             # Done before the liveness check so an e-stop press is handled
@@ -1263,7 +1340,8 @@ def main() -> int:
             # S to the Mega; don't wait for the firmware heartbeat to expire.
             alive, reason = controller_alive(js)
             if not alive:
-                print(f"[ps5] controller lost ({reason}) — retracting pedals.")
+                print(f"[ps5] controller lost ({reason}) — panic-braking.")
+                panic_disconnect = True
                 running = False
                 break
 
@@ -1492,6 +1570,14 @@ def main() -> int:
             gas = r2 * effective_gas_cap_now
             brake = l2 * BRAKE_POT_MAX
 
+            # ○ Circle = soft e-stop, tap-to-toggle (set/cleared in the
+            # JOYBUTTONDOWN handler). While ``circle_estop`` is True we
+            # override gas/brake to mirror the firmware ESTOP — brake=MAX,
+            # gas=0. Tap Circle again to clear.
+            if circle_estop:
+                gas = 0.0
+                brake = BRAKE_POT_MAX
+
             # Drive pedals first so the heartbeat ticks before we commit
             # to moving the steering wheel this frame.
             if control_pedals and pedals is not None:
@@ -1599,11 +1685,26 @@ def main() -> int:
             keepalive.join(timeout=1.0)
         except NameError:
             pass
-        if pedals is not None:
-            pedals.stop()
-            pedals.close()
-        if steering is not None:
-            steering.stop()
+        if panic_disconnect:
+            # Controller drop: command max brake before anything else,
+            # then drive the wheel to 0° under power. Skip the normal
+            # pedals.stop() (which would *release* the brake); after
+            # close() the firmware's heartbeat watchdog latches its
+            # own failsafe (brake=MAX, gas=0) so the brake stays on.
+            if pedals is not None:
+                pedals.panic_brake()
+            if steering is not None:
+                steering.panic_zero()
+            if pedals is not None:
+                pedals.close()
+            if steering is not None:
+                steering.stop()
+        else:
+            if pedals is not None:
+                pedals.stop()
+                pedals.close()
+            if steering is not None:
+                steering.stop()
         pygame.quit()
         print("[main] done.")
 
